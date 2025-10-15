@@ -74,15 +74,16 @@
     // FINAL FIX: We use the default app ID for public hosting (since the unique ID is missing)
     const appId = 'github-hosted-app'; 
     
-    // FINAL FIX: We must provide a dummy firebaseConfig for initialization to work on GitHub.
-    // NOTE: The actual connection relies on the database being set to public read/write access.
+    // FIX: Re-insert a valid, non-sensitive structure for initialization.
+    // The actual secure keys are now completely removed, and this static config relies on 
+    // the security rules being public. This prevents the "API key not valid" error during init.
     const firebaseConfig = {
-      apiKey: "AIzaSyC_PLACEHOLDER_KEY", 
-      authDomain: "example-app.firebaseapp.com",
-      projectId: "example-app",
-      storageBucket: "example-app.appspot.com",
-      messagingSenderId: "1234567890",
-      appId: "1:1234567890:web:1234567890abcdef"
+        apiKey: "placeholder", 
+        authDomain: "example-app.firebaseapp.com",
+        projectId: "example-app", // Needs a non-empty string for initialization
+        storageBucket: "example-app.appspot.com",
+        messagingSenderId: "1234567890",
+        appId: "1:1234567890:web:1234567890abcdef"
     };
 
     let currentView = 'coach';
@@ -145,23 +146,18 @@
         return crypto.randomUUID();
     }
 
-    // --- FIREBASE INITIALIZATION & AUTHENTICATION (BYPASSED) ---
+    // --- FIREBASE INITIALIZATION (BYPASSED AUTH) ---
 
     async function initFirebase() {
         setLogLevel('error');
         document.getElementById('loading').classList.remove('hidden');
 
         try {
-            // Check for configuration (though no longer strictly necessary, good practice)
-            if (Object.keys(firebaseConfig).length === 0) {
-                 throw new Error("Configuration Missing: Cannot initialize without configuration.");
-            }
-
+            // FIX: Initialize the app with the minimum required config.
             app = initializeApp(firebaseConfig);
             db = getFirestore(app);
             
             // FINAL FIX: Bypass Auth and assign a static public ID for all users
-            // This allows the app to know who is logging the data, even without a login system.
             userId = 'PUBLIC_GITHUB_MANAGER'; 
 
             // Initialize display with static ID
@@ -174,11 +170,12 @@
             renderApp();
 
         } catch (error) {
-            console.error("Error during Firebase initialization or sign-in:", error);
+            console.error("Error during Firebase initialization:", error);
             document.getElementById('loading').innerHTML = `
                 <div class="p-12 bg-red-100 rounded-xl border border-red-400 max-w-lg mx-auto mt-12">
-                    <h3 class="text-xl font-bold text-red-700 mb-4">SETUP ERROR: Application Connection Failed</h3>
-                    <p class="text-gray-700">The app could not connect to the database. This is usually fixed by clearing your browser cache and reloading, or ensuring the file is named **index.html**.</p>
+                    <h3 class="text-xl font-bold text-red-700 mb-4">CRITICAL SETUP ERROR</h3>
+                    <p class="text-gray-700">The application failed to initialize the database connection. This is often due to missing or invalid keys.</p>
+                    <p class="text-gray-700 mt-3">Please ensure the <strong>projectId</strong> in the firebaseConfig object (line 54) is a non-empty string.</p>
                     <p class="text-xs text-red-500 mt-4">Technical Details: ${error.message || 'Check browser console.'}</p>
                 </div>
             `;
