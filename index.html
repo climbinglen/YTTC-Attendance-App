@@ -64,18 +64,18 @@
 <script type="module">
     // Import necessary Firebase modules
     import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
-    import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+    // Authentication is bypassed for public hosting, only Firestore is needed
     import { getFirestore, doc, setDoc, onSnapshot, collection, Timestamp, writeBatch, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
     // --- GLOBAL VARIABLES ---
-    let app, db, auth;
+    let app, db;
     let userId;
     
     // FINAL FIX: We use the default app ID for public hosting (since the unique ID is missing)
     const appId = 'github-hosted-app'; 
     
     // FINAL FIX: We must provide a dummy firebaseConfig for initialization to work on GitHub.
-    // NOTE: The actual connection is handled by the security rules being public for this generic ID.
+    // NOTE: The actual connection relies on the database being set to public read/write access.
     const firebaseConfig = {
       apiKey: "AIzaSyC_PLACEHOLDER_KEY", 
       authDomain: "example-app.firebaseapp.com",
@@ -145,37 +145,29 @@
         return crypto.randomUUID();
     }
 
-    // --- FIREBASE INITIALIZATION & AUTHENTICATION ---
+    // --- FIREBASE INITIALIZATION & AUTHENTICATION (BYPASSED) ---
 
     async function initFirebase() {
         setLogLevel('error');
         document.getElementById('loading').classList.remove('hidden');
 
         try {
+            // Check for configuration (though no longer strictly necessary, good practice)
+            if (Object.keys(firebaseConfig).length === 0) {
+                 throw new Error("Configuration Missing: Cannot initialize without configuration.");
+            }
+
             app = initializeApp(firebaseConfig);
             db = getFirestore(app);
-            auth = getAuth(app);
+            
+            // FINAL FIX: Bypass Auth and assign a static public ID for all users
+            // This allows the app to know who is logging the data, even without a login system.
+            userId = 'PUBLIC_GITHUB_MANAGER'; 
 
-            // FINAL FIX: Use anonymous sign-in which is less restricted on public URLs
-            await signInAnonymously(auth);
+            // Initialize display with static ID
+            document.getElementById('user-info').textContent = `User: PUBLIC_MANAGER`;
 
-            // Handle Authentication State Change
-            await new Promise(resolve => {
-                const unsubscribe = onAuthStateChanged(auth, (user) => {
-                    if (user) {
-                        userId = user.uid;
-                        // Display the user ID, since we cannot guarantee coach name lookup immediately
-                        document.getElementById('user-info').textContent = `User ID: ${userId.substring(0, 8)}...`;
-                        unsubscribe();
-                        resolve();
-                    } else {
-                        // Should not happen with anonymous sign-in, but handle error
-                        throw new Error("Anonymous sign-in failed.");
-                    }
-                });
-            });
-
-            // Start real-time listeners after successful anonymous sign-in
+            // Start real-time listeners immediately
             setupRealtimeListeners();
             
             document.getElementById('loading').classList.add('hidden');
@@ -230,6 +222,7 @@
             // Update the display name in the header right away
             if (userId) {
                  const coachInfo = globalData.allCoaches[userId];
+                 // If the static PUBLIC_GITHUB_MANAGER ID is found in the coaches list, display the name.
                  const displayId = coachInfo ? coachInfo.name : `ID: ${userId.substring(0, 8)}...`;
                  document.getElementById('user-info').textContent = `User: ${displayId}`;
             }
@@ -718,7 +711,7 @@
         });
 
         // NEW: 2. Coaches (Using the current user ID for the mock coach entry)
-        // FINAL FIX: We now use the current user's anonymous ID for Coach Alex, which is created automatically on page load.
+        // FINAL FIX: We now use the current user's static PUBLIC_GITHUB_MANAGER ID.
         const mockCoachId = userId; 
         const coachesData = [
             { id: mockCoachId, name: "Coach Alex (Manager)" },
