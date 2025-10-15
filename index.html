@@ -1,516 +1,932 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Team Attendance Tracker</title>
-    <!-- Load Tailwind CSS -->
-    <script src="https://cdn.tailwindcss.com"></script>
-    <!-- Load Inter font -->
-    <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
-        body {
-            font-family: 'Inter', sans-serif;
-            background-color: #f8f9fa;
-        }
-        .header-gradient {
-            background-image: linear-gradient(to right, #4f46e5, #8b5cf6);
-        }
-        /* Custom scrollbar for better look */
-        .custom-scroll::-webkit-scrollbar {
-            width: 8px;
-        }
-        .custom-scroll::-webkit-scrollbar-thumb {
-            background-color: #8b5cf6;
-            border-radius: 10px;
-        }
-        .custom-scroll::-webkit-webkit-scrollbar-track {
-            background: #e5e7eb;
-        }
-    </style>
-</head>
-<body>
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getFirestore, doc, setDoc, onSnapshot, collection, Timestamp, deleteDoc, writeBatch } from 'firebase/firestore';
 
-<div id="app" class="min-h-screen flex flex-col">
-    <!-- Header -->
-    <header class="header-gradient p-4 text-white shadow-lg flex justify-between items-center">
-        <h1 class="text-2xl font-bold">Team Attendance Dashboard</h1>
-        <div class="text-sm flex items-center space-x-4">
-            <!-- DISPLAY NAME NOW USES A MOCK/ANONYMOUS ID -->
-            <span id="user-info" class="text-gray-200">Loading user...</span>
-            <button id="toggle-view-btn" onclick="window.toggleAppView()" class="bg-white text-indigo-600 hover:bg-indigo-100 font-semibold py-2 px-4 rounded-lg shadow transition duration-150 ease-in-out">
-                Switch to Manager View
-            </button>
-        </div>
-    </header>
+// --- CONFIGURATION AND CONSTANTS ---
+const API_KEY = ""; // Placeholder for Gemini API Key
+const ADMIN_CODE = 'ADMIN123';
+const APP_ID = 'github-hosted-app';
+const FIREBASE_CONFIG = {
+    apiKey: "placeholder", 
+    projectId: "example-app", 
+};
+const DAYS_OF_WEEK_NAMES = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
-    <!-- Main Content Area -->
-    <main class="flex-grow p-6">
-        <div id="content" class="max-w-7xl mx-auto">
-            <div id="loading" class="text-center p-12">
-                <div class="animate-spin rounded-full h-10 w-10 border-b-2 border-indigo-500 mx-auto"></div>
-                <p class="mt-4 text-gray-600">Initializing system...</p>
-            </div>
-            <!-- Dynamic content will be rendered here -->
-        </div>
-    </main>
+// --- FIREBASE SETUP ---
+let app, db;
+try {
+    app = initializeApp(FIREBASE_CONFIG);
+    db = getFirestore(app);
+} catch (e) {
+    console.error("Firebase init failed outside component:", e);
+}
 
-    <!-- Simple Message Box -->
-    <div id="message-box" class="fixed top-4 right-4 bg-green-500 text-white p-4 rounded-lg shadow-xl hidden z-50 transition duration-300"></div>
 
-</div>
+function getAttendancePath(collectionName) {
+    return `artifacts/${APP_ID}/public/data/${collectionName}`;
+}
 
-<!-- Firebase Scripts -->
-<script type="module">
-    // Import necessary Firebase modules
-    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
-    // Authentication is bypassed for public hosting, only Firestore is needed
-    import { getFirestore, doc, setDoc, onSnapshot, collection, Timestamp, writeBatch, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+const initialCoachId = localStorage.getItem('selectedCoachId') || null;
 
-    // --- GLOBAL VARIABLES ---
-    let app, db;
-    let userId;
+// --- UTILITY FUNCTIONS ---
+
+const getTodayKey = () => new Date().toISOString().split('T')[0];
+
+const formatDateTime = (timestamp) => {
+    if (!timestamp) return 'N/A';
+    const date = timestamp.toDate();
+    return date.toLocaleDateString('en-US', { 
+        weekday: 'short', 
+        year: 'numeric', 
+        month: 'short', 
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit'
+    });
+};
+
+const getMonthName = (monthIndex) => {
+    const months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+    return months[monthIndex];
+};
+
+const getCurrentDayName = () => {
+    const dayIndex = new Date().getDay();
+    // Shift array: 0 (Sun) -> index 6, 1 (Mon) -> index 0, etc.
+    return DAYS_OF_WEEK_NAMES[dayIndex === 0 ? 6 : dayIndex - 1];
+};
+
+
+// --- APP COMPONENT ---
+
+window.App = function App() { // FIX: Attach App to the global window object
+    const [globalData, setGlobalData] = useState({
+        allClasses: {}, allAthletes: {}, allRosters: {}, 
+        attendanceLogs: {}, allCoaches: {}, allManagers: {}
+    });
+    const [userId] = useState('PUBLIC_GITHUB_MANAGER');
+    const [selectedCoachId, setSelectedCoachId] = useState(initialCoachId);
+    const [currentView, setCurrentView] = useState('coach');
+    const [adminLocked, setAdminLocked] = useState(true);
+    const [managerMode, setManagerMode] = useState('dashboard');
+    const [selectedReportMonth, setSelectedReportMonth] = useState(new Date().getMonth());
+    const [selectedReportYear, setSelectedReportYear] = useState(new Date().getFullYear());
+    const [selectedDayFilter, setSelectedDayFilter] = useState(getCurrentDayName());
+    const [message, setMessage] = useState(null);
     
-    // FINAL FIX: We use the default app ID for public hosting (since the unique ID is missing)
-    const appId = 'github-hosted-app'; 
-    
-    // FIX: Re-insert a valid, non-sensitive structure for initialization.
-    // The actual secure keys are now completely removed, and this static config relies on 
-    // the security rules being public. This prevents the "API key not valid" error during init.
-    const firebaseConfig = {
-        apiKey: "placeholder", 
-        authDomain: "example-app.firebaseapp.com",
-        projectId: "example-app", // Needs a non-empty string for initialization
-        storageBucket: "example-app.appspot.com",
-        messagingSenderId: "1234567890",
-        appId: "1:1234567890:web:1234567890abcdef"
-    };
-
-    let currentView = 'coach';
-    let currentCoachState = {
-        mode: 'dashboard', 
+    // State for Attendance Taking View
+    const [coachState, setCoachState] = useState({
+        mode: 'select', // 'select', 'dashboard', 'attendance'
         classId: null,
         className: '',
         expectedRoster: [], 
         officialRoster: new Set(),
         currentAttendance: new Set()
-    };
-    let globalData = {
-        allClasses: {},
-        allAthletes: {},
-        allRosters: {}, 
-        attendanceLogs: {},
-        allCoaches: {}
-    };
+    });
 
-    // --- UTILITY FUNCTIONS ---
-
-    function showMessage(message, type = 'success') {
-        const box = document.getElementById('message-box');
-        box.textContent = message;
-        box.className = `fixed top-4 right-4 text-white p-4 rounded-lg shadow-xl z-50 transition duration-300 ${type === 'success' ? 'bg-green-500' : 'bg-red-500'}`;
-        box.classList.remove('hidden');
-        setTimeout(() => {
-            box.classList.add('hidden');
-        }, 3000);
-    }
-
-    function getAttendancePath(collectionName) {
-        // Public data path is now fixed to the generic appId
-        return `artifacts/${appId}/public/data/${collectionName}`;
-    }
-
-    function formatDateTime(timestamp) {
-        if (!timestamp) return 'N/A';
-        const date = timestamp.toDate();
-        return date.toLocaleDateString('en-US', { 
-            weekday: 'short', 
-            year: 'numeric', 
-            month: 'short', 
-            day: 'numeric',
-            hour: '2-digit',
-            minute: '2-digit'
+    // --- EFFECT: DATA LISTENERS ---
+    useEffect(() => {
+        const collections = ['classes', 'athletes', 'rosters', 'coaches', 'attendance_log', 'managers'];
+        const unsubscribes = collections.map(collectionName => {
+            const unsubscribe = onSnapshot(collection(db, getAttendancePath(collectionName)), (snapshot) => {
+                setGlobalData(prevData => {
+                    const newData = {};
+                    snapshot.forEach(doc => {
+                        newData[doc.id] = { id: doc.id, ...doc.data() };
+                    });
+                    return { ...prevData, [`all${collectionName.charAt(0).toUpperCase() + collectionName.slice(1)}`]: newData };
+                });
+            }, (error) => console.error(`Error reading ${collectionName}:`, error));
+            return unsubscribe;
         });
-    }
 
-    function formatDate(date) {
-        if (!date) return 'N/A';
-        return date.toLocaleDateString('en-US', { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric' });
-    }
+        return () => unsubscribes.forEach(unsub => unsub());
+    }, []);
+    
+    // --- UTILITIES & MESSAGING ---
+    
+    const showMessage = useCallback((text, type = 'success') => {
+        setMessage({ text, type });
+        setTimeout(() => setMessage(null), 3000);
+    }, []);
 
-    function getTodayKey() {
-        return (new Date()).toISOString().split('T')[0];
-    }
+    const isManager = useMemo(() => selectedCoachId && globalData.allManagers[selectedCoachId], [selectedCoachId, globalData.allManagers]);
 
-    function generateRandomId() {
-        return crypto.randomUUID();
-    }
+    // R6 FIX: Ensure header updates immediately on state change
+    const updateCoachHeader = useCallback((id) => {
+        const coachInfo = globalData.allCoaches[id];
+        const displayName = coachInfo ? coachInfo.name : `ID: ${id?.substring(0, 8) || 'Unidentified'}...`;
+        document.getElementById('user-info').textContent = `Logged in as: ${displayName}`;
+    }, [globalData.allCoaches]);
 
-    // --- FIREBASE INITIALIZATION (BYPASSED AUTH) ---
-
-    async function initFirebase() {
-        setLogLevel('error');
-        document.getElementById('loading').classList.remove('hidden');
-
-        try {
-            // FIX: Initialize the app with the minimum required config.
-            app = initializeApp(firebaseConfig);
-            db = getFirestore(app);
-            
-            // FINAL FIX: Bypass Auth and assign a static public ID for all users
-            userId = 'PUBLIC_GITHUB_MANAGER'; 
-
-            // Initialize display with static ID
-            document.getElementById('user-info').textContent = `User: PUBLIC_MANAGER`;
-
-            // Start real-time listeners immediately
-            setupRealtimeListeners();
-            
-            document.getElementById('loading').classList.add('hidden');
-            renderApp();
-
-        } catch (error) {
-            console.error("Error during Firebase initialization:", error);
-            document.getElementById('loading').innerHTML = `
-                <div class="p-12 bg-red-100 rounded-xl border border-red-400 max-w-lg mx-auto mt-12">
-                    <h3 class="text-xl font-bold text-red-700 mb-4">CRITICAL SETUP ERROR</h3>
-                    <p class="text-gray-700">The application failed to initialize the database connection. This is often due to missing or invalid keys.</p>
-                    <p class="text-gray-700 mt-3">Please ensure the <strong>projectId</strong> in the firebaseConfig object (line 54) is a non-empty string.</p>
-                    <p class="text-xs text-red-500 mt-4">Technical Details: ${error.message || 'Check browser console.'}</p>
-                </div>
-            `;
+    // R6 FIX: Re-run header update whenever selectedCoachId changes
+    useEffect(() => {
+        if (selectedCoachId) {
+            updateCoachHeader(selectedCoachId);
         }
-    }
-
-    function setupRealtimeListeners() {
-        // Listener for Classes
-        onSnapshot(collection(db, getAttendancePath('classes')), (snapshot) => {
-            globalData.allClasses = {};
-            snapshot.forEach(doc => {
-                globalData.allClasses[doc.id] = { id: doc.id, ...doc.data() };
-            });
-            renderApp();
-        }, (error) => console.error("Error reading classes:", error));
-
-        // Listener for Athletes
-        onSnapshot(collection(db, getAttendancePath('athletes')), (snapshot) => {
-            globalData.allAthletes = {};
-            snapshot.forEach(doc => {
-                globalData.allAthletes[doc.id] = { id: doc.id, ...doc.data() };
-            });
-            renderApp();
-        }, (error) => console.error("Error reading athletes:", error));
-
-        // Listener for Rosters
-        onSnapshot(collection(db, getAttendancePath('rosters')), (snapshot) => {
-            globalData.allRosters = {};
-            snapshot.forEach(doc => {
-                globalData.allRosters[doc.id] = { id: doc.id, ...doc.data() };
-            });
-            renderApp();
-        }, (error) => console.error("Error reading rosters:", error));
-        
-        // Listener for Coaches
-        onSnapshot(collection(db, getAttendancePath('coaches')), (snapshot) => {
-            globalData.allCoaches = {};
-            snapshot.forEach(doc => {
-                globalData.allCoaches[doc.id] = { id: doc.id, ...doc.data() };
-            });
-            // Update the display name in the header right away
-            if (userId) {
-                 const coachInfo = globalData.allCoaches[userId];
-                 // If the static PUBLIC_GITHUB_MANAGER ID is found in the coaches list, display the name.
-                 const displayId = coachInfo ? coachInfo.name : `ID: ${userId.substring(0, 8)}...`;
-                 document.getElementById('user-info').textContent = `User: ${displayId}`;
-            }
-            renderApp();
-        }, (error) => console.error("Error reading coaches:", error));
+    }, [selectedCoachId, updateCoachHeader]);
 
 
-        // Listener for Attendance Logs
-        onSnapshot(collection(db, getAttendancePath('attendance_log')), (snapshot) => {
-            globalData.attendanceLogs = {};
-            snapshot.forEach(doc => {
-                globalData.attendanceLogs[doc.id] = { id: doc.id, ...doc.data() };
-            });
-            renderApp();
-        }, (error) => console.error("Error reading attendance logs:", error));
-    }
+    // --- R6: COACH SELECTION LOGIC ---
 
-
-    // --- APP LOGIC AND VIEWS ---
-
-    function renderApp() {
-        if (currentView === 'coach') {
-            renderCoachView();
-        } else {
-            renderManagerView();
-        }
-    }
-
-    // Exported function for inline HTML call
-    window.toggleAppView = () => {
-        currentView = currentView === 'coach' ? 'manager' : 'coach';
-        document.getElementById('toggle-view-btn').textContent = currentView === 'coach' ? 'Switch to Manager View' : 'Switch to Coach View';
-        renderApp();
+    const handleSelectCoach = (id) => {
+        setSelectedCoachId(id);
+        localStorage.setItem('selectedCoachId', id);
+        setCoachState(prev => ({ ...prev, mode: 'dashboard' }));
     };
 
-    // --- COACH VIEW IMPLEMENTATION ---
-
-    function renderCoachView() {
-        const contentDiv = document.getElementById('content');
-        if (currentCoachState.mode === 'dashboard') {
-            contentDiv.innerHTML = `
-                <div class="p-6 bg-white rounded-xl shadow-2xl">
-                    <h2 class="text-3xl font-extrabold text-gray-800 mb-6 border-b-2 border-indigo-400 pb-2">Coach Dashboard - Today's Classes (${formatDate(new Date())})</h2>
-                    <div id="class-list" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                        ${Object.values(globalData.allClasses).length > 0
-                            ? Object.values(globalData.allClasses).map(c => `
-                                <div class="bg-indigo-50 p-6 rounded-xl border border-indigo-200 shadow-md flex flex-col justify-between hover:shadow-lg transition duration-150">
-                                    <div>
-                                        <p class="text-xl font-semibold text-indigo-700">${c.name}</p>
-                                        <p class="text-sm text-gray-600 mb-4">${c.time}</p>
-                                    </div>
-                                    <button onclick="window.startAttendance('${c.id}', '${c.name}')" class="mt-4 w-full bg-indigo-600 text-white font-bold py-2 rounded-lg hover:bg-indigo-700 transition duration-150 shadow-md hover:shadow-lg">
-                                        Take Attendance
-                                    </button>
-                                </div>
-                            `).join('')
-                            : `<p class="text-gray-500 col-span-3">No classes are currently scheduled. Use the 'Initialize Mock Data' button below to add some.</p>`
-                        }
-                    </div>
-                </div>
-                <div class="mt-8 text-center">
-                    <button onclick="window.initializeMockData()" class="bg-gray-700 text-white font-semibold py-2 px-4 rounded-lg hover:bg-gray-800 transition duration-150">
-                        Initialize Mock Data (Run Once)
-                    </button>
-                </div>
-            `;
-        } else if (currentCoachState.mode === 'attendance') {
-            const roster = currentCoachState.expectedRoster;
-            contentDiv.innerHTML = `
-                <div class="p-6 bg-white rounded-xl shadow-2xl">
-                    <button onclick="window.cancelAttendance()" class="text-indigo-600 hover:text-indigo-800 mb-4 flex items-center">
-                        <svg class="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 19l-7-7m0 0l7-7m-7 7h18"></path></svg>
-                        Back to Classes
-                    </button>
-                    <h2 class="text-3xl font-extrabold text-gray-800 mb-6 border-b-2 border-indigo-400 pb-2">
-                        Attendance for: ${currentCoachState.className}
-                    </h2>
-                    
-                    <!-- Scheduled Roster -->
-                    <div class="mb-8">
-                        <h3 class="text-xl font-semibold text-gray-700 mb-3">1. Scheduled Athletes (${roster.length})</h3>
-                        <p class="text-sm text-gray-500 mb-2">Mark the scheduled students who are present.</p>
-                        <div id="main-roster-list" class="h-64 overflow-y-auto custom-scroll p-4 border rounded-lg bg-gray-50">
-                            ${roster.length > 0
-                                ? roster.map(athleteId => {
-                                    const athlete = globalData.allAthletes[athleteId] || { name: 'Unknown Athlete', id: athleteId };
-                                    const isChecked = currentCoachState.currentAttendance.has(athlete.id);
-                                    
-                                    return `
-                                        <div id="athlete-${athlete.id}" onclick="window.togglePresence('${athlete.id}')"
-                                            class="flex items-center justify-between p-3 mb-2 rounded-lg cursor-pointer transition duration-100 ${isChecked ? 'bg-indigo-200 border-indigo-400 shadow-md' : 'bg-white border hover:bg-gray-100'}">
-                                            
-                                            <div class="flex items-center space-x-2">
-                                                <span class="text-lg font-medium ${isChecked ? 'text-indigo-800' : 'text-gray-700'}">${athlete.name}</span>
-                                                <span class="text-xs font-semibold bg-indigo-500 text-white px-2 py-0.5 rounded-full">SCHEDULED</span>
-                                            </div>
-
-                                            <span class="text-sm font-bold ${isChecked ? 'text-indigo-800' : 'text-gray-400'}">
-                                                ${isChecked ? 'PRESENT' : 'ABSENT'}
-                                            </span>
-                                        </div>
-                                    `;
-                                }).join('')
-                                : `<p class="text-gray-500">No scheduled athletes for this class.</p>`
-                            }
-                        </div>
-                    </div>
-
-                    <!-- Make-up / Unexpected Search -->
-                    <div class="mb-6">
-                        <h3 class="text-xl font-semibold text-gray-700 mb-3">2. Make-Up / Unexpected Attendance</h3>
-                        <input 
-                            type="text" 
-                            id="athlete-search-input"
-                            oninput="window.searchForAthlete(this.value)"
-                            placeholder="Type name to search for make-up students..." 
-                            class="w-full p-3 border-2 border-indigo-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 transition duration-150 mb-3"
-                        >
-                        <div id="search-results-list" class="max-h-48 overflow-y-auto custom-scroll border rounded-lg bg-white p-2">
-                            <p class="text-gray-400 italic text-sm p-2">Search results will appear here. Students marked present will be flagged as 'Unexpected' in the Manager View.</p>
-                        </div>
-                    </div>
-
-                    <div class="mt-6">
-                        <button onclick="window.saveAttendance()" class="w-full bg-green-600 text-white font-bold py-3 rounded-lg text-xl hover:bg-green-700 transition duration-150 shadow-lg hover:shadow-xl">
-                            Submit Attendance (${currentCoachState.currentAttendance.size} Present)
-                        </button>
-                    </div>
-                </div>
-            `;
-
-            // Re-render the attendance count on initial load
-            document.querySelector('.w-full.bg-green-600').textContent = `Submit Attendance (${currentCoachState.currentAttendance.size} Present)`;
-        }
-    }
-
-    // New search function for make-up students
-    window.searchForAthlete = (query) => {
-        const resultsDiv = document.getElementById('search-results-list');
-        const searchTerm = query.toLowerCase().trim();
-
-        if (searchTerm.length < 2) {
-            resultsDiv.innerHTML = `<p class="text-gray-400 italic text-sm p-2">Search results will appear here. Students marked present will be flagged as 'Unexpected' in the Manager View.</p>`;
-            return;
-        }
-        
-        // Find ALL athletes matching the search term (for checking if they are already scheduled)
-        const matchingAthletes = Object.values(globalData.allAthletes).filter(athlete => 
-            athlete.name.toLowerCase().includes(searchTerm)
-        );
-
-        if (matchingAthletes.length === 0) {
-            resultsDiv.innerHTML = `<p class="text-gray-400 italic text-sm p-2">No athletes found matching your search term.</p>`;
-            return;
-        }
-
-        // Separate matches into Scheduled (already in Section 1) and Make-up Candidates
-        const scheduledMatch = matchingAthletes.find(athlete => currentCoachState.officialRoster.has(athlete.id));
-        const makeUpCandidates = matchingAthletes.filter(athlete => !currentCoachState.officialRoster.has(athlete.id));
-
-        if (scheduledMatch) {
-            // Priority 1: If the search matches a student already on the schedule, alert the coach.
-            resultsDiv.innerHTML = `
-                <div class="p-3 mb-1 rounded-lg bg-indigo-100 border border-indigo-300 text-indigo-800 font-semibold text-sm">
-                    <p>⚠️ **${scheduledMatch.name}** is already in the **Scheduled Roster** (Section 1).</p>
-                    <p class="mt-1 font-normal text-xs">Please check them in above.</p>
-                </div>
-            `;
-            return;
-        }
-        
-        // Priority 2: If we only have make-up candidates, list them.
-        if (makeUpCandidates.length > 0) {
-            resultsDiv.innerHTML = makeUpCandidates.map(athlete => {
-                const isChecked = currentCoachState.currentAttendance.has(athlete.id);
-                return `
-                    <div id="athlete-${athlete.id}" onclick="window.togglePresence('${athlete.id}')"
-                        class="flex items-center justify-between p-3 mb-1 rounded-lg cursor-pointer transition duration-100 ${isChecked ? 'bg-yellow-200 border-yellow-400 shadow-sm' : 'bg-white border hover:bg-yellow-100'}">
-                        
-                        <div class="flex items-center space-x-2">
-                            <span class="text-lg font-medium ${isChecked ? 'text-yellow-800' : 'text-gray-700'}">${athlete.name}</span>
-                            <span class="text-xs font-semibold bg-yellow-500 text-white px-2 py-0.5 rounded-full">MAKE-UP CANDIDATE</span>
-                        </div>
-
-                        <span class="text-sm font-bold ${isChecked ? 'text-yellow-800' : 'text-gray-400'}">
-                            ${isChecked ? 'PRESENT' : 'NOT YET CHECKED'}
-                        </span>
-                    </div>
-                `;
-            }).join('');
-            return;
-        }
-
-        // Fallback (Should be covered by scheduledMatch check, but for safety)
-        resultsDiv.innerHTML = `<p class="text-gray-400 italic text-sm p-2">No athletes found matching your search who are NOT on the scheduled roster.</p>`;
+    const handleLogout = () => {
+        setSelectedCoachId(null);
+        localStorage.removeItem('selectedCoachId');
+        setCoachState(prev => ({ ...prev, mode: 'select' }));
+        setCurrentView('coach');
     };
 
+    // --- VIEWS TOGGLE ---
 
-    window.startAttendance = (classId, className) => {
+    const toggleAppView = () => {
+        if (currentView === 'coach' && !isManager) {
+            showMessage("Access Denied. Only managers can access the Admin Backend.", 'error');
+            return;
+        }
+        
+        setCurrentView(currentView === 'coach' ? 'manager' : 'coach');
+        setManagerMode('dashboard');
+        setAdminLocked(true); // Lock admin view when entering
+    };
+    
+    // --- ATTENDANCE LOGIC ---
+
+    const startAttendance = (classId, className) => {
+        if (!selectedCoachId) {
+             showMessage("Please select your name first.", 'error');
+             return;
+        }
         const rosterData = Object.values(globalData.allRosters).find(r => r.classId === classId);
-        let scheduledIds = [];
-        if (rosterData && Array.isArray(rosterData.athleteIds)) {
-            scheduledIds = rosterData.athleteIds;
-        }
-
-        // Initialize currentAttendance set with previously marked present students if any
-        // For simplicity in this demo, we start fresh, but in a real app, you might load a draft log.
+        let scheduledIds = rosterData && Array.isArray(rosterData.athleteIds) ? rosterData.athleteIds : [];
         
-        currentCoachState = {
+        setCoachState({
             mode: 'attendance',
             classId: classId,
             className: className,
-            expectedRoster: scheduledIds.sort((a, b) => { // Only scheduled students for the main list
-                const nameA = globalData.allAthletes[a]?.name || '';
-                const nameB = globalData.allAthletes[b]?.name || '';
-                return nameA.localeCompare(nameB);
-            }),
-            officialRoster: new Set(scheduledIds), // Store official roster set for quick lookups
+            expectedRoster: scheduledIds.sort((a, b) => (globalData.allAthletes[a]?.name || '').localeCompare(globalData.allAthletes[b]?.name || '')),
+            officialRoster: new Set(scheduledIds),
             currentAttendance: new Set()
-        };
-        renderApp();
+        });
     };
 
-    window.togglePresence = (athleteId) => {
-        const set = currentCoachState.currentAttendance;
-        const isScheduled = currentCoachState.officialRoster.has(athleteId);
-        
-        if (set.has(athleteId)) {
-            set.delete(athleteId);
-        } else {
-            set.add(athleteId);
-        }
-        
-        // Re-render the UI elements for both the main list and the search results list
-        const mainDiv = document.getElementById(`athlete-${athleteId}`);
-        if (mainDiv) {
-            const isChecked = set.has(athleteId);
-            const bgColor = isScheduled ? 'bg-indigo-200 border-indigo-400' : 'bg-yellow-200 border-yellow-400';
-            const hoverColor = isScheduled ? 'bg-white border hover:bg-gray-100' : 'bg-white border hover:bg-yellow-100';
-            const textColor = isScheduled ? 'text-indigo-800' : 'text-yellow-800';
-
-            mainDiv.className = `flex items-center justify-between p-3 mb-2 rounded-lg cursor-pointer transition duration-100 ${isChecked ? bgColor + ' shadow-md' : hoverColor}`;
-            mainDiv.querySelector('span:last-child').textContent = isChecked ? 'PRESENT' : (isScheduled ? 'ABSENT' : 'NOT YET CHECKED');
-            mainDiv.querySelector('span:last-child').className = `text-sm font-bold ${isChecked ? textColor : 'text-gray-400'}`;
-        }
-
-        // Re-run the search to update its list if the toggled athlete was a search result
-        const searchInput = document.getElementById('athlete-search-input');
-        if(searchInput) {
-             window.searchForAthlete(searchInput.value);
-        }
-
-        // Update the submit button count
-        document.querySelector('.w-full.bg-green-600').textContent = `Submit Attendance (${set.size} Present)`;
+    const togglePresence = (athleteId) => {
+        setCoachState(prev => {
+            const newAttendance = new Set(prev.currentAttendance);
+            if (newAttendance.has(athleteId)) {
+                newAttendance.delete(athleteId);
+            } else {
+                newAttendance.add(athleteId);
+            }
+            return { ...prev, currentAttendance: newAttendance };
+        });
+    };
+    
+    // FIX: This now safely returns to the dashboard mode and triggers a re-render
+    const cancelAttendance = () => {
+        setCoachState(prev => ({ ...prev, mode: 'dashboard', classId: null }));
     };
 
-    window.cancelAttendance = () => {
-        currentCoachState.mode = 'dashboard';
-        currentCoachState.classId = null;
-        renderApp();
-    };
+    const saveAttendance = async () => {
+        if (!coachState.classId || !selectedCoachId) return;
 
-    window.saveAttendance = async () => {
-        if (!currentCoachState.classId) return;
-
-        const logId = `${getTodayKey()}_${currentCoachState.classId}`;
-        const presentIds = Array.from(currentCoachState.currentAttendance);
+        const logId = `${getTodayKey()}_${coachState.classId}`;
+        const presentIds = Array.from(coachState.currentAttendance);
 
         const attendanceData = {
             dateKey: getTodayKey(),
-            classId: currentCoachState.classId,
-            className: currentCoachState.className,
-            coachId: userId,
+            classId: coachState.classId,
+            className: coachState.className,
+            coachId: selectedCoachId,
+            status: 'COMPLETED',
             presentAthleteIds: presentIds,
             timestamp: Timestamp.now()
         };
 
         try {
             await setDoc(doc(db, getAttendancePath('attendance_log'), logId), attendanceData);
-            showMessage('Attendance submitted successfully!');
-            window.cancelAttendance();
+            
+            // FIX: Auto return to dashboard and show message (guaranteed flow)
+            showMessage(`Attendance submitted successfully!`, 'success');
+            cancelAttendance();
+            
         } catch (error) {
             console.error("Error saving attendance:", error);
             showMessage('Error saving attendance.', 'error');
         }
     };
+    
+    // --- R5: CANCELLATION LOGIC ---
+
+    const confirmCancelClassDashboard = (classId, className) => {
+        if (!selectedCoachId) {
+             showMessage("Please select your name first.", 'error');
+             return;
+        }
+        const reason = prompt(`Reason for cancelling ${className}:`);
+        if (reason) {
+            saveCancellation(reason, classId, className);
+        }
+    };
+    
+    const saveCancellation = async (reason, classId, className) => {
+        if (!classId || !selectedCoachId) return;
+
+        const logId = `${getTodayKey()}_${classId}`;
+        const cancellationData = {
+            dateKey: getTodayKey(),
+            classId: classId,
+            className: className,
+            coachId: selectedCoachId,
+            status: 'CANCELLED',
+            cancellationReason: reason,
+            timestamp: Timestamp.now()
+        };
+
+        try {
+            await setDoc(doc(db, getAttendancePath('attendance_log'), logId), cancellationData);
+            showMessage(`Class ${className} has been cancelled.`, 'success');
+            // FIX: Force render update
+            cancelAttendance(); 
+        } catch (error) {
+            console.error("Error saving cancellation:", error);
+            showMessage('Error saving cancellation.', 'error');
+        }
+    };
+
+    const revertCancellation = async (classId) => {
+        if (!selectedCoachId) return;
+        const logId = `${getTodayKey()}_${classId}`;
+        
+        try {
+            await deleteDoc(doc(db, getAttendancePath('attendance_log'), logId));
+            showMessage(`Cancellation reverted. Class is now open.`, 'info');
+            // FIX: Force render update
+            cancelAttendance(); 
+        } catch (e) {
+            console.error("Error reverting cancellation:", e);
+            showMessage('Error reverting cancellation.', 'error');
+        }
+    };
+
+    // --- GEMINI API LOGIC (Moved inside) ---
+
+    const callGemini = async (systemPrompt, userQuery) => {
+        const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${API_KEY}`;
+        
+        if (!API_KEY) {
+             return "Error: API Key is missing. Please enter a valid key in the code.";
+        }
+
+        const payload = {
+            contents: [{ parts: [{ text: userQuery }] }],
+            systemInstruction: { parts: [{ text: systemPrompt }] },
+            tools: [{ "google_search": {} }]
+        };
+        
+        try {
+            const response = await fetch(apiUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            if (!response.ok) {
+                const errorBody = await response.json();
+                throw new Error(errorBody.error.message || `API call failed with status: ${response.status}`);
+            }
+
+            const result = await response.json();
+            const text = result.candidates?.[0]?.content?.parts?.[0]?.text;
+            return text || "No response generated.";
+            
+        } catch (error) {
+            console.error("Gemini API Error:", error);
+            return `Error: ${error.message}`;
+        }
+    };
+
+    const draftAttendanceMessage = async () => {
+        const athleteId = document.getElementById('athlete-select-comms').value;
+        const tone = document.getElementById('comms-tone').value;
+        const outputDiv = document.getElementById('comms-output');
+        
+        if (!athleteId) {
+            showMessage("Please select an athlete first.", 'error');
+            return;
+        }
+        
+        outputDiv.innerHTML = `<p className="text-center text-indigo-600 mt-4"><div className="animate-spin rounded-full h-6 w-6 border-b-2 border-indigo-500 mx-auto"></div> Drafting message...</p>`;
+        
+        let totalClasses = 0;
+        let attendedClasses = 0;
+        const athleteName = globalData.allAthletes[athleteId]?.name || "Unknown Athlete";
+        
+        Object.values(globalData.attendanceLogs).forEach(log => {
+            if (log.status === 'COMPLETED' && log.presentAthleteIds.includes(athleteId)) {
+                attendedClasses++;
+            }
+            if (log.status === 'COMPLETED') { 
+                 totalClasses++;
+            }
+        });
+        
+        const attendanceRate = totalClasses > 0 ? ((attendedClasses / totalClasses) * 100).toFixed(1) : 0;
+        const attendanceSummary = `Athlete ${athleteName} has attended ${attendedClasses} out of ${totalClasses} classes, an attendance rate of ${attendanceRate}%.`;
+        
+        const systemPrompt = `You are an AI Communications Assistant for a youth sports team. Your task is to draft a concise, professional message (email or text) to the parents of an athlete based on their attendance record. The tone must be ${tone}. The output should be ready to copy and paste.`;
+        const userQuery = `Draft a message using this data: "${attendanceSummary}". If the rate is below 70%, express concern and ask for reasons. If the rate is above 90%, offer praise and encouragement. Keep the message under 150 words.`;
+        
+        const result = await callGemini(systemPrompt, userQuery);
+        
+        outputDiv.innerHTML = `
+            <div className="mt-4 p-4 bg-gray-50 rounded-lg border border-gray-200">
+                <p className="text-sm font-semibold text-gray-700 mb-2">Drafted Message (${tone} Tone):</p>
+                <div id="draft-message" className="whitespace-pre-wrap text-gray-800">${result}</div>
+            </div>
+            <button onClick={() => {
+                const messageText = document.getElementById('draft-message').innerText;
+                navigator.clipboard.writeText(messageText);
+                showMessage('Copied to clipboard!', 'success');
+            }} className="mt-3 bg-indigo-500 text-white font-bold py-2 px-4 rounded-lg hover:bg-indigo-600 transition duration-150">
+                Copy Message
+            </button>
+        `;
+    };
+    
+    const analyzeRosterPerformance = async () => {
+        const classId = document.getElementById('roster-analysis-class-select').value;
+        const outputDiv = document.getElementById('roster-analysis-output');
+        
+        if (!classId) {
+            showMessage("Please select a class for analysis.", 'error');
+            return;
+        }
+
+        outputDiv.innerHTML = `<p className="text-center text-indigo-600 mt-4"><div className="animate-spin rounded-full h-6 w-6 border-b-2 border-indigo-500 mx-auto"></div> Analyzing class roster...</p>`;
+
+        const classDef = globalData.allClasses[classId];
+        const rosterDoc = Object.values(globalData.allRosters).find(r => r.classId === classId);
+        const scheduledAthletes = rosterDoc?.athleteIds || [];
+        const rosterSize = scheduledAthletes.length;
+        
+        const scheduledNames = scheduledAthletes.map(id => globalData.allAthletes[id]?.name || 'Unknown').join(', ');
+        const classInfo = `${classDef.name} (${classDef.time}) has a roster size of ${rosterSize} athletes: ${scheduledNames}.`;
+        
+        const systemPrompt = `You are a Sports Program Analyst. Analyze the provided class roster information and offer 3 distinct recommendations on class management. Focus on ideas for maximizing athlete development, handling class size, and optimizing skill progression for the group listed.`;
+        const userQuery = `Analyze the following class structure and provide 3 actionable management recommendations: ${classInfo}.`;
+        
+        const result = await callGemini(systemPrompt, userQuery);
+        
+        outputDiv.innerHTML = `
+            <div className="mt-4 p-4 bg-gray-50 rounded-xl border border-gray-200 whitespace-pre-wrap">${result}</div>
+        `;
+    };
+
+    // --- RENDER VIEWS ---
+
+    const renderCoachDashboard = () => {
+        // Render functions use the stable `coachState` and `globalData`
+        const todayKey = getTodayKey();
+        
+        const filteredClasses = Object.values(globalData.allClasses).filter(c => {
+            const dayMatch = c.time.split(' ')[0] === selectedDayFilter;
+            return dayMatch;
+        }).sort((a, b) => a.time.localeCompare(b.time));
+
+        return (
+            <div className="p-6 bg-white rounded-xl shadow-2xl">
+                <div className="flex justify-between items-center mb-6 border-b-2 border-indigo-400 pb-2">
+                    <h2 className="text-3xl font-extrabold text-gray-800">Classes for {selectedDayFilter}, {new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}</h2>
+                    <button onClick={handleLogout} className="text-sm bg-gray-200 text-gray-600 px-3 py-1 rounded-lg hover:bg-gray-300">
+                        Log Out
+                    </button>
+                </div>
+                
+                {/* R2: Day Selector Tabs */}
+                <div className="flex space-x-2 mb-6 overflow-x-auto pb-2">
+                    {DAYS_OF_WEEK_NAMES.map(day => (
+                        <button key={day} onClick={() => setSelectedDayFilter(day)} className={`flex-shrink-0 px-4 py-2 rounded-full font-semibold transition duration-150 ${selectedDayFilter === day ? 'bg-indigo-600 text-white shadow-md' : 'bg-indigo-100 text-indigo-700 hover:bg-indigo-200'}`}>
+                            {day}
+                        </button>
+                    ))}
+                </div>
+
+                <div id="class-list" className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                    {filteredClasses.length > 0 ? (
+                        filteredClasses.map(c => {
+                            const logKey = `${todayKey}_${c.id}`;
+                            const todayLog = globalData.attendanceLogs[logKey];
+                            const isCancelled = todayLog && todayLog.status === 'CANCELLED';
+                            const isLogged = todayLog && todayLog.status === 'COMPLETED';
+
+                            if (isCancelled) {
+                                return (
+                                    <div key={c.id} className="bg-red-100 p-6 rounded-xl border border-red-300 shadow-md flex flex-col justify-between">
+                                        <p className="text-xl font-semibold text-red-800">{c.name}</p>
+                                        <p className="text-sm text-red-600 mb-4">{c.time}</p>
+                                        <p className="text-xs font-bold text-red-700 mt-2">CLASS CANCELLED</p>
+                                        <p className="text-sm italic text-red-700">Reason: {todayLog.cancellationReason || 'N/A'}</p>
+                                        <button onClick={() => revertCancellation(c.id)} className="mt-4 w-full bg-yellow-500 text-white font-bold py-2 rounded-lg hover:bg-yellow-600 transition duration-150 shadow-md text-sm">
+                                            Revert Cancellation
+                                        </button>
+                                    </div>
+                                );
+                            } else if (isLogged) {
+                                return (
+                                    <div key={c.id} className="bg-green-100 p-6 rounded-xl border border-green-300 shadow-md flex flex-col justify-between opacity-70">
+                                        <p className="text-xl font-semibold text-green-800">{c.name}</p>
+                                        <p className="text-sm text-green-600 mb-4">{c.time}</p>
+                                        <p className="text-sm font-bold text-green-700 mt-2">ATTENDANCE LOGGED</p>
+                                    </div>
+                                );
+                            } else {
+                                return (
+                                    <div key={c.id} className="bg-indigo-50 p-6 rounded-xl border border-indigo-200 shadow-md flex flex-col justify-between hover:shadow-lg transition duration-150">
+                                        <div>
+                                            <p className="text-xl font-semibold text-indigo-700">{c.name}</p>
+                                            <p className="text-sm text-gray-600 mb-4">{c.time}</p>
+                                        </div>
+                                        <div className="flex flex-col space-y-2 mt-4">
+                                            <button onClick={() => startAttendance(c.id, c.name)} className="w-full bg-indigo-600 text-white font-bold py-2 rounded-lg hover:bg-indigo-700 transition duration-150 shadow-md">
+                                                Take Attendance
+                                            </button>
+                                            <button onClick={() => confirmCancelClassDashboard(c.id, c.name)} className="w-full bg-red-500 text-white font-bold py-2 rounded-lg hover:bg-red-600 transition duration-150 shadow-md text-sm">
+                                                Cancel Class
+                                            </button>
+                                        </div>
+                                    </div>
+                                );
+                            }
+                        })
+                    ) : (
+                        <p className="text-gray-500 col-span-3">No classes scheduled for {selectedDayFilter}.</p>
+                    )}
+                </div>
+                <div className="mt-8 text-center">
+                    <button onClick={() => initializeMockData(userId)} className="bg-gray-700 text-white font-semibold py-2 px-4 rounded-lg hover:bg-gray-800 transition duration-150">
+                        Initialize Mock Data (Run Once)
+                    </button>
+                </div>
+            </div>
+        );
+    };
+
+    const renderCoachAttendance = () => {
+        const { expectedRoster, currentAttendance } = coachState;
+        
+        const searchForAthlete = (query) => {
+            const resultsDiv = document.getElementById('search-results-list');
+            const searchTerm = query.toLowerCase().trim();
+            if (searchTerm.length < 2) {
+                resultsDiv.innerHTML = `<p className="text-gray-400 italic text-sm p-2">Search results will appear here. Students marked present will be flagged as 'Unexpected' in the Manager View.</p>`;
+                return;
+            }
+            
+            const matchingAthletes = Object.values(globalData.allAthletes).filter(athlete => 
+                athlete.name.toLowerCase().includes(searchTerm)
+            );
+
+            if (matchingAthletes.length === 0) {
+                resultsDiv.innerHTML = `<p className="text-gray-400 italic text-sm p-2">No athletes found matching your search term.</p>`;
+                return;
+            }
+
+            const scheduledMatch = matchingAthletes.find(athlete => coachState.officialRoster.has(athlete.id));
+            const makeUpCandidates = matchingAthletes.filter(athlete => !coachState.officialRoster.has(athlete.id));
+
+            if (scheduledMatch) {
+                resultsDiv.innerHTML = `
+                    <div className="p-3 mb-1 rounded-lg bg-indigo-100 border border-indigo-300 text-indigo-800 font-semibold text-sm">
+                        <p>⚠️ <strong>${scheduledMatch.name}</strong> is already in the <strong>Scheduled Roster</strong> (Section 1).</p>
+                        <p className="mt-1 font-normal text-xs">Please check them in above.</p>
+                    </div>
+                `;
+                return;
+            }
+            
+            if (makeUpCandidates.length > 0) {
+                resultsDiv.innerHTML = makeUpCandidates.map(athlete => {
+                    const isChecked = currentAttendance.has(athlete.id);
+                    return `
+                        <div id="athlete-${athlete.id}" onclick="window.togglePresence('${athlete.id}')"
+                            class="flex items-center justify-between p-3 mb-1 rounded-lg cursor-pointer transition duration-100 ${isChecked ? 'bg-yellow-200 border-yellow-400 shadow-sm' : 'bg-white border hover:bg-yellow-100'}">
+                            
+                            <div class="flex items-center space-x-2">
+                                <span class="text-lg font-medium ${isChecked ? 'text-yellow-800' : 'text-gray-700'}">${athlete.name}</span>
+                                <span class="text-xs font-semibold bg-yellow-500 text-white px-2 py-0.5 rounded-full">MAKE-UP CANDIDATE</span>
+                            </div>
+
+                            <span class="text-sm font-bold ${isChecked ? 'text-yellow-800' : 'text-gray-400'}">
+                                ${isChecked ? 'PRESENT' : 'NOT YET CHECKED'}
+                            </span>
+                        </div>
+                    `;
+                }).join('');
+                return;
+            }
+        };
+
+        // Expose to window for inline HTML (search bar)
+        window.searchForAthlete = searchForAthlete;
+        window.togglePresence = togglePresence;
 
 
-    // --- MANAGER VIEW IMPLEMENTATION (The Analysis Backend) ---
+        return (
+            <div className="p-6 bg-white rounded-xl shadow-2xl">
+                <button onClick={cancelAttendance} className="text-indigo-600 hover:text-indigo-800 mb-4 flex items-center">
+                    <svg className="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10 19l-7-7m0 0l7-7m-7 7h18"></path></svg>
+                    Back to Classes
+                </button>
+                <h2 className="text-3xl font-extrabold text-gray-800 mb-6 border-b-2 border-indigo-400 pb-2">
+                    Attendance for: {coachState.className}
+                </h2>
+                
+                {/* Scheduled Roster */}
+                <div className="mb-8">
+                    <h3 className="text-xl font-semibold text-gray-700 mb-3">1. Scheduled Athletes ({expectedRoster.length})</h3>
+                    <p className="text-sm text-gray-500 mb-2">Mark the scheduled students who are present.</p>
+                    <div id="main-roster-list" className="h-64 overflow-y-auto custom-scroll p-4 border rounded-lg bg-gray-50">
+                        {expectedRoster.length > 0 ? (
+                            expectedRoster.map(athleteId => {
+                                const athlete = globalData.allAthletes[athleteId] || { name: 'Unknown Athlete', id: athleteId };
+                                const isChecked = currentAttendance.has(athlete.id);
+                                return (
+                                    <div key={athlete.id} id={`athlete-${athlete.id}`} onClick={() => togglePresence(athlete.id)}
+                                        className={`flex items-center justify-between p-3 mb-2 rounded-lg cursor-pointer transition duration-100 ${isChecked ? 'bg-indigo-200 border-indigo-400 shadow-md' : 'bg-white border hover:bg-gray-100'}`}>
+                                        
+                                        <div className="flex items-center space-x-2">
+                                            <span className={`text-lg font-medium ${isChecked ? 'text-indigo-800' : 'text-gray-700'}`}>{athlete.name}</span>
+                                            <span className="text-xs font-semibold bg-indigo-500 text-white px-2 py-0.5 rounded-full">SCHEDULED</span>
+                                        </div>
 
-    function getAttendanceAnalysis() {
+                                        <span className={`text-sm font-bold ${isChecked ? 'text-indigo-800' : 'text-gray-400'}`}>
+                                            {isChecked ? 'PRESENT' : 'ABSENT'}
+                                        </span>
+                                    </div>
+                                );
+                            })
+                        ) : (
+                            <p className="text-gray-500">No scheduled athletes for this class.</p>
+                        )}
+                    </div>
+                </div>
+
+                {/* Make-up / Unexpected Search */}
+                <div className="mb-6">
+                    <h3 className="text-xl font-semibold text-gray-700 mb-3">2. Make-Up / Unexpected Attendance</h3>
+                    <input 
+                        type="text" 
+                        id="athlete-search-input"
+                        onInput={(e) => searchForAthlete(e.target.value)}
+                        placeholder="Type name to search for make-up students..." 
+                        className="w-full p-3 border-2 border-indigo-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 transition duration-150 mb-3"
+                    />
+                    <div id="search-results-list" className="max-h-48 overflow-y-auto custom-scroll border rounded-lg bg-white p-2">
+                        <p className="text-gray-400 italic text-sm p-2">Search results will appear here. Students marked present will be flagged as 'Unexpected' in the Manager View.</p>
+                    </div>
+                </div>
+
+                <div className="mt-6 flex space-x-4">
+                    <button id="submit-attendance-btn" onClick={saveAttendance} className="w-full bg-green-600 text-white font-bold py-3 rounded-lg text-xl hover:bg-green-700 transition duration-150 shadow-lg hover:shadow-xl">
+                        Submit Attendance ({currentAttendance.size} Present)
+                    </button>
+                </div>
+            </div>
+        );
+    };
+
+    const renderCoachView = () => {
+        // Ensure data is loaded before rendering components
+        if (Object.keys(globalData.allCoaches).length === 0) {
+            return (
+                 <div className="max-w-md mx-auto p-8 bg-white rounded-xl shadow-2xl mt-12 text-center">
+                    <p className="text-red-500">Loading initial data or coaches list is empty.</p>
+                    <div className="mt-8">
+                        <button onClick={() => initializeMockData(userId)} className="bg-gray-700 text-white font-semibold py-2 px-4 rounded-lg hover:bg-gray-800 transition duration-150">
+                            Initialize Mock Data (Run Once)
+                        </button>
+                    </div>
+                </div>
+            );
+        }
+
+        if (coachState.mode === 'select' || !selectedCoachId) {
+            return (
+                <div className="max-w-md mx-auto p-8 bg-white rounded-xl shadow-2xl mt-12 text-center">
+                    <h2 className="text-3xl font-extrabold text-indigo-700 mb-6">Welcome! Who are you?</h2>
+                    <select id="coach-select" onChange={(e) => handleSelectCoach(e.target.value)} className="w-full p-3 border-2 border-indigo-300 rounded-lg mb-4 text-gray-700">
+                        <option value="">-- Select Your Name --</option>
+                        {Object.values(globalData.allCoaches).map(c => (
+                            <option key={c.id} value={c.id}>{c.name}</option>
+                        ))}
+                    </select>
+                    <button onClick={() => handleSelectCoach(document.getElementById('coach-select').value)} className="w-full bg-indigo-600 text-white font-bold py-3 rounded-lg hover:bg-indigo-700 transition duration-150 shadow-md">
+                        Log In
+                    </button>
+                     <div className="mt-8">
+                        <button onClick={() => initializeMockData(userId)} className="bg-gray-700 text-white font-semibold py-2 px-4 rounded-lg hover:bg-gray-800 transition duration-150">
+                            Initialize Mock Data (Run Once)
+                        </button>
+                    </div>
+                </div>
+            );
+        }
+
+        if (coachState.mode === 'dashboard') {
+            return renderCoachDashboard();
+        }
+
+        if (coachState.mode === 'attendance') {
+            return renderCoachAttendance();
+        }
+    };
+    
+    // --- R4: ADMIN LOCK LOGIC ---
+    
+    const checkAdminCode = () => {
+        const code = document.getElementById('admin-code-input').value;
+        if (code === ADMIN_CODE) {
+            setAdminLocked(false);
+            showMessage("Admin Unlocked!", 'success');
+        } else {
+            showMessage("Incorrect Code.", 'error');
+            document.getElementById('admin-code-input').value = '';
+        }
+    };
+
+    const renderAdminLock = () => (
+        <div className="max-w-md mx-auto p-8 bg-white rounded-xl shadow-2xl mt-12 text-center">
+            <h2 className="text-3xl font-extrabold text-red-700 mb-6">ADMIN ACCESS REQUIRED</h2>
+            <p className="text-gray-600 mb-4">Please enter the secret code to access reports and administrative tools.</p>
+            <input type="password" id="admin-code-input" placeholder="Enter Secret Code (Default: ADMIN123)" className="w-full p-3 border-2 border-red-300 rounded-lg mb-4 text-gray-700"/>
+            <button onClick={checkAdminCode} className="w-full bg-red-600 text-white font-bold py-3 rounded-lg hover:bg-red-700 transition duration-150 shadow-md">
+                Unlock Admin
+            </button>
+        </div>
+    );
+    
+    // --- ADMIN TOOLS LOGIC (Partially included from previous version) ---
+    
+    const addNewAthlete = async () => {
+        const name = document.getElementById('new-athlete-name').value.trim();
+        if (!name) { showMessage("Please enter the athlete's name.", 'error'); return; }
+
+        const newAthlete = { id: crypto.randomUUID(), name: name };
+        try {
+            await setDoc(doc(db, getAttendancePath('athletes'), newAthlete.id), { name: newAthlete.name });
+            document.getElementById('new-athlete-name').value = '';
+            showMessage(`Athlete ${name} added successfully!`, 'success');
+        } catch (e) { showMessage("Error adding athlete.", 'error'); console.error(e); }
+    };
+    
+    const addNewClass = async () => {
+        const name = document.getElementById('new-class-name').value.trim();
+        const day = document.getElementById('new-class-day').value;
+        const time = document.getElementById('new-class-time').value.trim();
+        
+        if (!name || !day || !time) { showMessage("Please fill all class fields.", 'error'); return; }
+
+        const newClass = { id: crypto.randomUUID(), name: name, time: `${day} ${time}` };
+        try {
+            await setDoc(doc(db, getAttendancePath('classes'), newClass.id), { name: newClass.name, time: newClass.time });
+            document.getElementById('new-class-name').value = '';
+            document.getElementById('new-class-day').value = '';
+            document.getElementById('new-class-time').value = '';
+            showMessage(`Class ${name} (${day}) added successfully!`, 'success');
+        } catch (e) { showMessage("Error adding class.", 'error'); console.error(e); }
+    };
+
+    const updateRoster = async () => {
+        const classId = document.getElementById('roster-class-select').value;
+        const selectedAthleteIds = Array.from(document.getElementById('roster-athlete-list').selectedOptions).map(option => option.value);
+
+        if (!classId) { showMessage("Please select a class.", 'error'); return; }
+
+        const rosterData = { classId: classId, athleteIds: selectedAthleteIds };
+        
+        try {
+            await setDoc(doc(db, getAttendancePath('rosters'), classId), rosterData);
+            showMessage(`Roster for ${globalData.allClasses[classId].name} updated (${selectedAthleteIds.length} athletes)!`, 'success');
+        } catch (e) { showMessage("Error updating roster.", 'error'); console.error(e); }
+    };
+    
+    const loadRosterForEdit = () => {
+        const classId = document.getElementById('roster-class-select').value;
+        const athleteList = document.getElementById('roster-athlete-list');
+        athleteList.innerHTML = '';
+        
+        const currentRoster = Object.values(globalData.allRosters).find(r => r.classId === classId);
+        const rosterIds = new Set(currentRoster ? currentRoster.athleteIds : []);
+        
+        const allAthletes = Object.values(globalData.allAthletes).sort((a, b) => a.name.localeCompare(b.name));
+
+        allAthletes.forEach(athlete => {
+            const option = document.createElement('option');
+            option.value = athlete.id;
+            option.textContent = athlete.name;
+            if (rosterIds.has(athlete.id)) {
+                option.selected = true;
+            }
+            athleteList.appendChild(option);
+        });
+        
+        if (classId) {
+             showMessage(`Roster loaded for editing. Hold CTRL/CMD to select multiple names.`, 'info');
+        }
+    };
+    
+    // --- RENDER ADMIN / BACKEND VIEWS ---
+
+    const renderAdminToolsContent = () => {
+        const allClasses = Object.values(globalData.allClasses).sort((a, b) => a.name.localeCompare(b.name));
+        const allAthletes = Object.values(globalData.allAthletes).sort((a, b) => a.name.localeCompare(b.name));
+        const allCoaches = Object.values(globalData.allCoaches).sort((a, b) => a.name.localeCompare(b.name));
+
+        return (
+            <>
+            <h2 className="text-3xl font-extrabold text-gray-800 mb-6 border-b-2 border-indigo-400 pb-2">Admin Tools</h2>
+            
+            {/* 4. Manage Managers (Security) */}
+            <div className="bg-white p-6 rounded-xl shadow-lg mb-8 border border-red-300">
+                <h3 className="text-2xl font-bold text-red-700 mb-4 border-b pb-2">4. Manage Managers (Security)</h3>
+                <p className="text-sm text-gray-600 mb-4">Assign who can access this Admin Backend.</p>
+                
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4 items-center">
+                    <select id="manager-coach-select" onChange={loadManagerStatus} className="p-3 border rounded-lg md:col-span-1">
+                        <option value="">-- Select Coach to Authorize --</option>
+                        {allCoaches.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                    </select>
+
+                    <div className="flex items-center space-x-2 md:col-span-1">
+                        <input type="checkbox" id="manager-status-checkbox" className="h-5 w-5 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500"/>
+                        <label htmlFor="manager-status-checkbox" className="text-sm font-medium text-gray-700">Is Manager?</label>
+                        <span className="text-xs text-red-500 font-semibold ml-2">({Object.values(globalData.allManagers).length} currently active)</span>
+                    </div>
+
+                    <button id="manager-update-btn" onClick={updateManagerStatus} disabled className="bg-red-600 text-white font-bold py-3 rounded-lg hover:bg-red-700 transition duration-150">
+                        Select Coach to Edit
+                    </button>
+                </div>
+            </div>
+
+            {/* 1. Add New Class Form */}
+            <div className="bg-white p-6 rounded-xl shadow-lg mb-8 border border-indigo-200">
+                <h3 className="text-2xl font-bold text-indigo-700 mb-4 border-b pb-2">1. Add New Class</h3>
+                <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                    <input type="text" id="new-class-name" placeholder="Class Name (e.g., Advanced Tumbling)" className="p-3 border rounded-lg md:col-span-2"/>
+                    <select id="new-class-day" className="p-3 border rounded-lg">
+                        <option value="">Select Day</option>
+                        {DAYS_OF_WEEK_NAMES.map(d => <option key={d} value={d}>{d}</option>)}
+                    </select>
+                    <input type="text" id="new-class-time" placeholder="Time (e.g., 6:00 PM)" className="p-3 border rounded-lg"/>
+                </div>
+                <button onClick={addNewClass} className="mt-4 w-full bg-indigo-600 text-white font-bold py-3 rounded-lg hover:bg-indigo-700 transition duration-150">
+                    Add Class
+                </button>
+            </div>
+
+            {/* 2. Add New Athlete Form */}
+            <div className="bg-white p-6 rounded-xl shadow-lg mb-8 border border-indigo-200">
+                <h3 className="text-2xl font-bold text-indigo-700 mb-4 border-b pb-2">2. Add New Athlete</h3>
+                <div className="flex space-x-4">
+                    <input type="text" id="new-athlete-name" placeholder="Athlete Full Name" className="p-3 border rounded-lg flex-grow"/>
+                    <button onClick={addNewAthlete} className="bg-indigo-600 text-white font-bold py-3 px-6 rounded-lg hover:bg-indigo-700 transition duration-150">
+                        Add Athlete
+                    </button>
+                </div>
+            </div>
+            
+            {/* 3. Manage Rosters (Assign Athletes to Classes) */}
+            <div className="bg-white p-6 rounded-xl shadow-lg mb-8 border border-indigo-200">
+                <h3 className="text-2xl font-bold text-indigo-700 mb-4 border-b pb-2">3. Manage Class Rosters</h3>
+                <p className="text-sm text-gray-600 mb-4">Assign which athletes are scheduled for which class.</p>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <select id="roster-class-select" onChange={loadRosterForEdit} className="p-3 border rounded-lg">
+                        <option value="">-- Select Class to Edit --</option>
+                        {allClasses.map(c => <option key={c.id} value={c.id}>{c.name} ({c.time})</option>)}
+                    </select>
+                </div>
+                <div className="mt-4">
+                    <p className="text-sm font-semibold text-gray-700 mb-2">Scheduled Athletes (Hold CTRL/CMD to select multiple)</p>
+                    <select id="roster-athlete-list" multiple size="10" className="w-full p-3 border rounded-lg focus:ring-indigo-500 text-gray-700">
+                        {allAthletes.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+                    </select>
+                </div>
+                <button onClick={updateRoster} className="mt-4 w-full bg-green-600 text-white font-bold py-3 rounded-lg hover:bg-green-700 transition duration-150">
+                    Save Roster Changes
+                </button>
+            </div>
+            </>
+        );
+    };
+
+    const loadManagerStatus = () => {
+        const coachId = document.getElementById('manager-coach-select').value;
+        const checkbox = document.getElementById('manager-status-checkbox');
+        const updateButton = document.getElementById('manager-update-btn');
+        
+        if (!coachId) {
+             checkbox.checked = false;
+             updateButton.disabled = true;
+             updateButton.textContent = 'Select Coach to Edit';
+             return;
+        }
+        
+        const isManager = globalData.allManagers[coachId] ? true : false;
+        checkbox.checked = isManager;
+        updateButton.disabled = false;
+        updateButton.textContent = `Update ${globalData.allCoaches[coachId].name}`;
+    };
+
+    const updateManagerStatus = async () => {
+        const coachId = document.getElementById('manager-coach-select').value;
+        const isManager = document.getElementById('manager-status-checkbox').checked;
+
+        if (!coachId) { showMessage("Please select a coach first.", 'error'); return; }
+
+        const managerDocRef = doc(db, getAttendancePath('managers'), coachId);
+        
+        try {
+            if (isManager) {
+                await setDoc(managerDocRef, { isManager: true, coachId: coachId });
+                showMessage(`${globalData.allCoaches[coachId].name} promoted to Manager.`, 'success');
+            } else {
+                await deleteDoc(managerDocRef);
+                showMessage(`${globalData.allCoaches[coachId].name} demoted.`, 'info');
+            }
+        } catch (e) { showMessage("Error updating manager status.", 'error'); console.error(e); }
+    };
+    
+    // --- LLM Tools Implementation ---
+
+    const renderGeminiTools = () => {
+        // Ensure globalData is available before trying to map it
+        if (!globalData.allClasses || !globalData.allAthletes) return null;
+        
+        const allClasses = Object.values(globalData.allClasses).sort((a, b) => a.name.localeCompare(b.name));
+        const allAthletes = Object.values(globalData.allAthletes).sort((a, b) => a.name.localeCompare(b.name));
+
+        return (
+            <div className="p-6">
+                <h2 className="text-3xl font-extrabold text-gray-800 mb-6 border-b-2 border-indigo-400 pb-2">✨ LLM Management Tools</h2>
+                
+                <p className="text-sm text-red-600 mb-6 font-semibold">NOTE: These tools require a valid Gemini API Key to be configured in the code's 'API_KEY' variable.</p>
+
+                {/* 1. Attendance Coach (Communication Drafts) */}
+                <div className="bg-white p-6 rounded-xl shadow-lg mb-8 border border-indigo-200">
+                    <h3 className="text-2xl font-bold text-indigo-700 mb-4 border-b pb-2">1. Attendance Coach (Communication Drafts)</h3>
+                    <p className="text-sm text-gray-600 mb-4">Analyze an athlete's historical attendance and draft a message for their parents.</p>
+                    
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4 items-center">
+                        <select id="athlete-select-comms" className="p-3 border rounded-lg md:col-span-1">
+                            <option value="">-- Select Athlete --</option>
+                            {allAthletes.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+                        </select>
+                        
+                        <select id="comms-tone" className="p-3 border rounded-lg md:col-span-1">
+                            <option value="Encouraging and Professional">Encouraging/Professional</option>
+                            <option value="Serious and Direct">Serious/Direct</option>
+                            <option value="Praising and Warm">Praising/Warm</option>
+                        </select>
+
+                        <button onClick={draftAttendanceMessage} className="bg-purple-600 text-white font-bold py-3 rounded-lg hover:bg-purple-700 transition duration-150 md:col-span-1">
+                            Draft Message ✨
+                        </button>
+                    </div>
+                    <div id="comms-output"></div>
+                </div>
+
+                {/* 2. Roster Status Analysis */}
+                <div className="bg-white p-6 rounded-xl shadow-lg mb-8 border border-indigo-200">
+                    <h3 className="text-2xl font-bold text-indigo-700 mb-4 border-b pb-2">2. Roster Status Analysis</h3>
+                    <p className="text-sm text-gray-600 mb-4">Get LLM recommendations on class management based on current roster size.</p>
+                    
+                    <div className="flex space-x-4">
+                        <select id="roster-analysis-class-select" className="p-3 border rounded-lg flex-grow">
+                            <option value="">-- Select Class for Analysis --</option>
+                            {allClasses.map(c => <option key={c.id} value={c.id}>{c.name} ({c.time})</option>)}
+                        </select>
+                        
+                        <button onClick={analyzeRosterPerformance} className="bg-purple-600 text-white font-bold py-3 px-6 rounded-lg hover:bg-purple-700 transition duration-150">
+                            Analyze Roster ✨
+                        </button>
+                    </div>
+                    <div id="roster-analysis-output"></div>
+                </div>
+                
+                {renderAdminToolsContent()}
+            </div>
+        );
+    };
+
+
+    const getAttendanceAnalysis = () => {
         const analysis = {};
         const todayKey = getTodayKey();
 
@@ -586,183 +1002,255 @@
         });
 
         return analysis;
-    }
+    };
 
 
-    function renderManagerView() {
-        const contentDiv = document.getElementById('content');
+    const renderManagerDashboard = () => {
+        if (adminLocked) {
+            return renderAdminLock();
+        }
+        
         const analysis = getAttendanceAnalysis();
         const classes = Object.values(globalData.allClasses).sort((a, b) => a.name.localeCompare(b.name));
         const hasAnyClasses = classes.length > 0;
-        const hasAnyLogs = Object.values(globalData.attendanceLogs).length > 0;
 
-        // 1. Check for missing classes (Data not initialized)
-        if (!hasAnyClasses) {
-            contentDiv.innerHTML = `
-                <div class="p-12 text-center bg-white rounded-xl shadow-lg border border-gray-200 mt-12">
-                    <h3 class="text-2xl font-bold text-indigo-700 mb-3">No Classes Found</h3>
-                    <p class="text-gray-600 mb-4">Please switch back to the Coach View and click the <strong>'Initialize Mock Data (Run Once)'</strong> button to load your classes and athlete rosters.</p>
-                </div>
-            `;
-            return;
-        }
+        const currentMonthName = getMonthName(selectedReportMonth);
         
-        // 2. Check for missing logs (Data initialized, but attendance not taken)
-        if (hasAnyClasses && !hasAnyLogs) {
-             contentDiv.innerHTML = `
-                <div class="p-12 text-center bg-white rounded-xl shadow-lg border border-gray-200 mt-12">
-                    <h3 class="text-2xl font-bold text-indigo-700 mb-3">No Attendance Logs Found</h3>
-                    <p class="text-gray-600 mb-4">The system knows your classes, but no coach has submitted attendance yet.</p>
-                    <p class="text-gray-600">Please switch back to the Coach View to log at least one class attendance, then return here.</p>
-                </div>
-            `;
-            return;
-        }
-        
-        // 3. Render full dashboard (Classes and Logs exist)
-        const dashboardHTML = classes.map(classDef => {
-            const classAnalysis = analysis[classDef.id];
-            const hasClassLogs = classAnalysis && classAnalysis.dailyLogs.length > 0;
-            
-            const logHTML = hasClassLogs ? classAnalysis.dailyLogs.map(log => `
-                <div class="border-b border-gray-200 p-4 last:border-b-0">
-                    <p class="text-lg font-semibold text-gray-700 mb-2">
-                        Log Time: ${formatDateTime(log.timestamp)} <span class="text-sm text-gray-500 font-normal ml-2">(${log.presentCount} Present)</span>
-                    </p>
-
-                    <!-- PRESENT LIST -->
-                    <div class="flex flex-col space-y-1 mb-2 bg-green-50 p-2 rounded-lg border border-green-200">
-                        <span class="font-bold text-green-700">Present Athletes:</span>
-                        <p class="text-sm italic">${log.presentNames.length > 0 ? log.presentNames.join(', ') : 'None'}</p>
-                    </div>
-
-                    <!-- ABSENT FLAGGING -->
-                    <div class="flex flex-col space-y-1 ${log.absent.length > 0 ? 'bg-red-50 p-2 rounded-lg border border-red-200' : 'text-green-600'}">
-                        <span class="font-bold ${log.absent.length > 0 ? 'text-red-700' : 'text-green-600'}">
-                            ${log.absent.length} Absent:
-                        </span>
-                        <p class="text-sm italic">${log.absent.length > 0 ? log.absent.join(', ') : 'Everyone expected was present!'}</p>
-                    </div>
-
-                    <!-- MAKE-UP FLAGGING -->
-                    <div class="flex flex-col space-y-1 mt-2 ${log.makeUp.length > 0 ? 'bg-yellow-50 p-2 rounded-lg border border-yellow-200' : 'text-gray-600'}">
-                        <span class="font-bold ${log.makeUp.length > 0 ? 'text-yellow-700' : 'text-gray-600'}">
-                            ${log.makeUp.length} Unexpected Attendees (Make-Up):
-                        </span>
-                        <p class="text-sm italic">${log.makeUp.length > 0 ? log.makeUp.join(', ') : 'No unexpected attendees.'}</p>
-                    </div>
-
-                    <p class="text-xs text-gray-400 mt-2">Recorded by: ${log.coachName}</p>
-                </div>
-            `).join('') : '<p class="p-4 text-gray-500 italic">No attendance has been logged for this class yet.</p>';
-
-            return `
-                <div class="bg-white rounded-xl shadow-lg border border-gray-200">
-                    <div class="p-5 border-b border-gray-200 bg-gray-50 rounded-t-xl">
-                        <h3 class="text-2xl font-extrabold text-indigo-700">${classDef.name}</h3>
-                        <p class="text-sm text-gray-600">Expected Roster Size: ${classAnalysis ? classAnalysis.expectedCount : 0}</p>
-                    </div>
-                    <div class="custom-scroll max-h-96 overflow-y-auto">
-                        ${logHTML}
-                    </div>
-                </div>
-            `;
-        }).join('');
-
-        contentDiv.innerHTML = `
-            <div class="p-6">
-                <h2 class="text-3xl font-extrabold text-gray-800 mb-8">Manager Attendance Overview (Last 7 Logs Per Class)</h2>
-                <div id="manager-dashboard" class="grid grid-cols-1 md:grid-cols-2 gap-8">
-                    ${dashboardHTML}
-                </div>
+        const yearOptions = [new Date().getFullYear() - 1, new Date().getFullYear(), new Date().getFullYear() + 1];
+        const filterUI = (
+            <div className="flex space-x-4 mb-6 items-center bg-gray-100 p-4 rounded-xl shadow-inner">
+                <h3 className="text-lg font-bold text-gray-700">Filter Reports:</h3>
+                <select onChange={(e) => setSelectedReportMonth(parseInt(e.target.value))} value={selectedReportMonth} className="p-2 border rounded-lg text-gray-700">
+                    {[...Array(12).keys()].map(i => <option key={i} value={i}>{getMonthName(i)}</option>)}
+                </select>
+                <select onChange={(e) => setSelectedReportYear(parseInt(e.target.value))} value={selectedReportYear} className="p-2 border rounded-lg text-gray-700">
+                    {yearOptions.map(y => <option key={y} value={y}>{y}</option>)}
+                </select>
+                <span className="text-sm text-gray-500 italic">Showing logs for {currentMonthName} {selectedReportYear}</span>
             </div>
-        `;
-    }
-
-    // --- MOCK DATA INITIALIZATION ---
-
-    window.initializeMockData = async () => {
-        const batch = writeBatch(db);
-
-        // 1. Athletes
-        // NOTE: Please replace this with your actual 70+ student roster!
-        const athletesData = [
-            { id: generateRandomId(), name: "Alice Johnson" },
-            { id: generateRandomId(), name: "Bob Smith" },
-            { id: generateRandomId(), name: "Charlie Brown" },
-            { id: generateRandomId(), name: "Dana Scully" },
-            { id: generateRandomId(), name: "Ethan Hunt" },
-            { id: generateRandomId(), name: "Fiona Glenn" },
-            { id: generateRandomId(), name: "Grace Hall" },
-            { id: generateRandomId(), name: "Henry Ice" },
-            { id: generateRandomId(), name: "Ivy Jones" },
-            { id: generateRandomId(), name: "Karl King" },
-            { id: generateRandomId(), name: "Leo Moon" },
-            { id: generateRandomId(), name: "Mia Nest" }, // Athlete 11 - NOT on Advanced Tumbling Roster
-            { id: generateRandomId(), name: "Oscar Petch" },
-            { id: generateRandomId(), name: "Quinn Rich" },
-            // Add more students here up to 70+
-        ];
-        athletesData.forEach(a => {
-            batch.set(doc(db, getAttendancePath('athletes'), a.id), { name: a.name });
-        });
-
-        // NEW: 2. Coaches (Using the current user ID for the mock coach entry)
-        // FINAL FIX: We now use the current user's static PUBLIC_GITHUB_MANAGER ID.
-        const mockCoachId = userId; 
-        const coachesData = [
-            { id: mockCoachId, name: "Coach Alex (Manager)" },
-            // If you had other coaches, you'd need to manually log in as them once to get their anonymous User IDs
-        ];
-        coachesData.forEach(c => {
-            batch.set(doc(db, getAttendancePath('coaches'), c.id), { name: c.name });
-        });
-
-
-        // 3. Classes
-        // NOTE: Please replace these with your actual classes and times!
-        const classesData = [
-            { id: generateRandomId(), name: "Advanced Tumbling", time: "Mon 6:00 PM" },
-            { id: generateRandomId(), name: "Beginner Gymnastics", time: "Wed 4:30 PM" },
-            { id: generateRandomId(), name: "Elite Team Practice", time: "Fri 7:00 PM" },
-        ];
-        classesData.forEach(c => {
-            batch.set(doc(db, getAttendancePath('classes'), c.id), { name: c.name, time: c.time });
-        });
-
-        // 4. Rosters (Expected Attendance)
-        // NOTE: This maps student IDs (from section 1) to Class IDs (from section 2)
-        const rostersData = [
-            { // Advanced Tumbling (5 Students)
-                classId: classesData[0].id,
-                athleteIds: [athletesData[0].id, athletesData[1].id, athletesData[3].id, athletesData[6].id, athletesData[8].id]
-            },
-            { // Beginner Gymnastics (4 Students)
-                classId: classesData[1].id,
-                athleteIds: [athletesData[2].id, athletesData[4].id, athletesData[5].id, athletesData[7].id]
-            },
-            { // Elite Team Practice (More Students)
-                classId: classesData[2].id,
-                athleteIds: athletesData.slice(5).map(a => a.id) // Fiona, Grace, Henry, Ivy, Karl, Leo, Mia, Oscar, Quinn
-            }
-        ];
-        rostersData.forEach(r => {
-            // Using classId as the document ID for simplicity in roster lookups
-            batch.set(doc(db, getAttendancePath('rosters'), r.classId), r);
-        });
-
-        try {
-            await batch.commit();
-            showMessage('Mock data initialized successfully! You can now take attendance.', 'success');
-        } catch (error) {
-            console.error("Error initializing mock data:", error);
-            showMessage('Error initializing mock data.', 'error');
+        );
+        
+        if (!hasAnyClasses) {
+            return (
+                <div className="p-12 text-center bg-white rounded-xl shadow-lg border border-gray-200 mt-4">
+                    <h3 className="text-2xl font-bold text-indigo-700 mb-3">No Classes Found</h3>
+                    <p className="text-gray-600 mb-4">Go to **Admin Tools** to set up your program.</p>
+                </div>
+            );
         }
+        
+        const filteredLogsByClass = classes.map(classDef => {
+            const classAnalysis = analysis[classDef.id];
+            if (!classAnalysis) return null;
+
+            const monthlyLogs = classAnalysis.totalLogs.filter(log => {
+                const logDate = log.timestamp.toDate();
+                return logDate.getMonth() === selectedReportMonth && logDate.getFullYear() === selectedReportYear;
+            });
+            
+            if (monthlyLogs.length === 0) return null;
+            
+            const dashboardHTML = monthlyLogs.map(log => (
+                <div key={`${log.logDate}-${classDef.id}-${log.timestamp.toMillis()}`} className={`border-b border-gray-200 p-4 last:border-b-0 ${log.status === 'CANCELLED' ? 'bg-red-50' : ''}`}>
+                    <p className="text-lg font-semibold text-gray-700 mb-2">
+                        Log Time: {formatDateTime(log.timestamp)} 
+                        <span className="text-sm text-gray-500 font-normal ml-2">({log.presentCount || 0} Present)</span>
+                    </p>
+                    {log.status === 'CANCELLED' ? (
+                        <>
+                            <p className="font-bold text-red-700">Class Status: CANCELLED</p>
+                            <p className="text-sm italic text-red-700">Reason: {log.cancellationReason}</p>
+                        </>
+                    ) : (
+                        <>
+                        {/* PRESENT LIST */}
+                        <div className="flex flex-col space-y-1 mb-2 bg-green-50 p-2 rounded-lg border border-green-200">
+                            <span className="font-bold text-green-700">Present Athletes:</span>
+                            <p className="text-sm italic text-gray-700">{log.presentNames.length > 0 ? log.presentNames.join(', ') : 'None'}</p>
+                        </div>
+                        {/* ABSENT FLAGGING */}
+                        <div className={`flex flex-col space-y-1 ${log.absent.length > 0 ? 'bg-red-50 p-2 rounded-lg border border-red-200' : 'text-green-600'}`}>
+                            <span className={`font-bold ${log.absent.length > 0 ? 'text-red-700' : 'text-green-600'}`}>
+                                {log.absent.length} Absent:
+                            </span>
+                            <p className={`text-sm italic ${log.absent.length > 0 ? 'text-red-700' : 'text-green-600'}`}>{log.absent.length > 0 ? log.absent.join(', ') : 'Everyone expected was present!'}</p>
+                        </div>
+                        {/* MAKE-UP FLAGGING */}
+                        <div className={`flex flex-col space-y-1 mt-2 ${log.makeUp.length > 0 ? 'bg-yellow-50 p-2 rounded-lg border border-yellow-200' : 'text-gray-600'}`}>
+                            <span className={`font-bold ${log.makeUp.length > 0 ? 'text-yellow-700' : 'text-gray-600'}`}>
+                                {log.makeUp.length} Unexpected Attendees (Make-Up):
+                            </span>
+                            <p className="text-sm italic text-gray-700">{log.makeUp.length > 0 ? log.makeUp.join(', ') : 'No unexpected attendees.'}</p>
+                        </div>
+                        </>
+                    )}
+                    <p className="text-xs text-gray-400 mt-2">Recorded by: {log.coachName}</p>
+                </div>
+            ));
+
+            return (
+                <div key={classDef.id} className="bg-white rounded-xl shadow-lg border border-gray-200">
+                    <div className="p-5 border-b border-gray-200 bg-gray-50 rounded-t-xl">
+                        <h3 className="text-2xl font-extrabold text-indigo-700">{classDef.name}</h3>
+                        <p className="text-sm text-gray-600">Total Logs for {currentMonthName}: {monthlyLogs.length}</p>
+                    </div>
+                    <div className="custom-scroll max-h-96 overflow-y-auto">
+                        {dashboardHTML}
+                    </div>
+                </div>
+            );
+        }).filter(html => html !== null);
+
+
+        return (
+            <>
+                <h2 className="text-3xl font-extrabold text-gray-800 mb-8">Monthly Attendance Reports</h2>
+                {filterUI}
+                <div id="manager-dashboard" className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                    {filteredLogsByClass.length > 0 ? filteredLogsByClass : (
+                        <p className="col-span-2 text-center text-gray-500 p-8 bg-white rounded-lg">No logs found for {currentMonthName} {selectedReportYear}.</p>
+                    )}
+                </div>
+            </>
+        );
     };
+    
+    // --- MAIN RENDER ---
+    
+    return (
+        <div className="min-h-screen flex flex-col">
+            <header className="header-gradient p-4 text-white shadow-lg flex justify-between items-center">
+                <h1 className="text-2xl font-bold">Team Attendance Dashboard</h1>
+                <div className="text-sm flex items-center space-x-4">
+                    <span id="user-info" className="text-gray-200">
+                        {selectedCoachId ? `Logged in as: ${globalData.allCoaches[selectedCoachId]?.name || 'Coach'}` : 'Unidentified'}
+                    </span>
+                    {isManager && (
+                         <button id="toggle-view-btn" onClick={toggleAppView} className="bg-white text-indigo-600 hover:bg-indigo-100 font-semibold py-2 px-4 rounded-lg shadow transition duration-150 ease-in-out">
+                            {currentView === 'coach' ? 'Switch to Admin / Backend' : 'Switch to Coach View'}
+                        </button>
+                    )}
+                </div>
+            </header>
+            <main className="flex-grow p-6">
+                <div id="content" className="max-w-7xl mx-auto">
+                    {Object.keys(globalData.allClasses).length === 0 && (
+                        <div id="loading" className="text-center p-12">
+                            <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-indigo-500 mx-auto"></div>
+                            <p className="mt-4 text-gray-600">Initializing system...</p>
+                        </div>
+                    )}
+                    
+                    {currentView === 'coach' ? renderCoachView() : (managerMode === 'gemini' ? renderGeminiTools() : (managerMode === 'admin' ? renderAdminToolsContent() : renderManagerDashboard()))}
+                </div>
+            </main>
+            
+            {/* Simple Message Box */}
+            {message && (
+                <div id="message-box" className={`fixed top-4 right-4 text-white p-4 rounded-lg shadow-xl z-50 transition duration-300 ${message.type === 'success' ? 'bg-green-500' : 'bg-red-500'}`}>
+                    {message.text}
+                </div>
+            )}
+        </div>
+    );
+}
 
-    // Initialize Firebase when the window loads
-    window.onload = initFirebase;
+// --- MOCK DATA INITIALIZATION (Adapted for new structure) ---
 
-</script>
-</body>
-</html>
+const initializeMockData = async (userId) => {
+    const batch = writeBatch(db);
+
+    const generateRandomId = () => crypto.randomUUID();
+    const mockManagerId = userId || 'PUBLIC_GITHUB_MANAGER'; 
+
+    // 1. Athletes
+    const athletesData = [
+        { id: generateRandomId(), name: "Alice Johnson" },
+        { id: generateRandomId(), name: "Bob Smith" },
+        { id: generateRandomId(), name: "Charlie Brown" },
+        { id: generateRandomId(), name: "Dana Scully" },
+        { id: generateRandomId(), name: "Ethan Hunt" },
+        { id: generateRandomId(), name: "Fiona Glenn" },
+        { id: generateRandomId(), name: "Grace Hall" },
+        { id: generateRandomId(), name: "Henry Ice" },
+        { id: generateRandomId(), name: "Ivy Jones" },
+        { id: generateRandomId(), name: "Karl King" },
+        { id: generateRandomId(), name: "Leo Moon" },
+        { id: generateRandomId(), name: "Mia Nest" }, 
+        { id: generateRandomId(), name: "Oscar Petch" },
+        { id: generateRandomId(), name: "Quinn Rich" },
+    ];
+    athletesData.forEach(a => batch.set(doc(db, getAttendancePath('athletes'), a.id), { name: a.name }));
+
+    // 2. Coaches
+    const coachesData = [
+        { id: mockManagerId, name: "Coach Alex (Manager)" },
+        { id: generateRandomId(), name: "Coach Sarah" },
+        { id: generateRandomId(), name: "Coach Ben" },
+    ];
+    coachesData.forEach(c => batch.set(doc(db, getAttendancePath('coaches'), c.id), { name: c.name }));
+    
+    // 3. Managers
+    const managersData = [
+        { id: mockManagerId, isManager: true }
+    ];
+    managersData.forEach(m => batch.set(doc(db, getAttendancePath('managers'), m.id), { isManager: m.isManager }));
+
+
+    // 4. Classes
+    const classesData = [
+        { id: generateRandomId(), name: "Intermediate Prep", time: "Mon 5:00 PM" }, // MON CLASS 1
+        { id: generateRandomId(), name: "Advanced Tumbling", time: "Mon 6:00 PM" }, // MON CLASS 2
+        { id: generateRandomId(), name: "Beginner Intro", time: "Mon 7:30 PM" }, // MON CLASS 3
+        { id: generateRandomId(), name: "Beginner Gymnastics", time: "Wed 4:30 PM" },
+        { id: generateRandomId(), name: "Elite Team Practice", time: "Fri 7:00 PM" },
+        { id: generateRandomId(), name: "Weekend Prep", time: "Sat 10:00 AM" },
+    ];
+    classesData.forEach(c => batch.set(doc(db, getAttendancePath('classes'), c.id), { name: c.name, time: c.time }));
+
+    // 5. Rosters (Expected Attendance)
+    const rostersData = [
+        { // Intermediate Prep (Mon 5:00 PM) - 3 students
+            classId: classesData[0].id,
+            athleteIds: [athletesData[2].id, athletesData[3].id, athletesData[4].id]
+        },
+        { // Advanced Tumbling (Mon 6:00 PM) - 5 students (Mia Nest NOT INCLUDED)
+            classId: classesData[1].id,
+            athleteIds: [athletesData[0].id, athletesData[1].id, athletesData[6].id, athletesData[8].id, athletesData[9].id]
+        },
+         { // Beginner Intro (Mon 7:30 PM) - 4 students
+            classId: classesData[2].id,
+            athleteIds: [athletesData[3].id, athletesData[5].id, athletesData[10].id, athletesData[11].id]
+        },
+        { // Beginner Gymnastics (Wed 4:30 PM)
+            classId: classesData[3].id,
+            athleteIds: [athletesData[2].id, athletesData[4].id, athletesData[5].id, athletesData[7].id]
+        },
+        { // Elite Team Practice (Fri 7:00 PM)
+            classId: classesData[4].id,
+            athleteIds: athletesData.slice(5).map(a => a.id) 
+        }
+    ];
+    rostersData.forEach(r => batch.set(doc(db, getAttendancePath('rosters'), r.classId), r));
+
+    try {
+        await batch.commit();
+        return true;
+    } catch (error) {
+        console.error("Error initializing mock data:", error);
+        return false;
+    }
+};
+
+window.initializeMockData = async (userId) => {
+    const success = await initializeMockData(userId);
+    const message = success 
+        ? 'Mock data initialized successfully! You can now select a coach.' 
+        : 'Error initializing mock data.';
+    // Use window.location.reload() to force a clean re-render after init
+    // For React structure, we trust the listener to update state, but a hard reload is the safest alternative here.
+    alert(message); // Using alert here because the message system relies on state which is about to reload
+    window.location.reload(); 
+};
+
+export default App;
