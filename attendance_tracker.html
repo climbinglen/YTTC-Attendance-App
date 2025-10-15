@@ -1,0 +1,781 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Team Attendance Tracker</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load Inter font -->
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f8f9fa;
+        }
+        .header-gradient {
+            background-image: linear-gradient(to right, #4f46e5, #8b5cf6);
+        }
+        /* Custom scrollbar for better look */
+        .custom-scroll::-webkit-scrollbar {
+            width: 8px;
+        }
+        .custom-scroll::-webkit-scrollbar-thumb {
+            background-color: #8b5cf6;
+            border-radius: 10px;
+        }
+        .custom-scroll::-webkit-webkit-scrollbar-track {
+            background: #e5e7eb;
+        }
+    </style>
+</head>
+<body>
+
+<div id="app" class="min-h-screen flex flex-col">
+    <!-- Header -->
+    <header class="header-gradient p-4 text-white shadow-lg flex justify-between items-center">
+        <h1 class="text-2xl font-bold">Team Attendance Dashboard</h1>
+        <div class="text-sm flex items-center space-x-4">
+            <span id="user-info" class="text-gray-200">Loading user...</span>
+            <button id="toggle-view-btn" onclick="window.toggleAppView()" class="bg-white text-indigo-600 hover:bg-indigo-100 font-semibold py-2 px-4 rounded-lg shadow transition duration-150 ease-in-out">
+                Switch to Manager View
+            </button>
+        </div>
+    </header>
+
+    <!-- Main Content Area -->
+    <main class="flex-grow p-6">
+        <div id="content" class="max-w-7xl mx-auto">
+            <div id="loading" class="text-center p-12">
+                <div class="animate-spin rounded-full h-10 w-10 border-b-2 border-indigo-500 mx-auto"></div>
+                <p class="mt-4 text-gray-600">Initializing system...</p>
+            </div>
+            <!-- Dynamic content will be rendered here -->
+        </div>
+    </main>
+
+    <!-- Simple Message Box -->
+    <div id="message-box" class="fixed top-4 right-4 bg-green-500 text-white p-4 rounded-lg shadow-xl hidden z-50 transition duration-300"></div>
+
+</div>
+
+<!-- Firebase Scripts -->
+<script type="module">
+    // Import necessary Firebase modules
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+    import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+    import { getFirestore, doc, getDoc, addDoc, setDoc, updateDoc, onSnapshot, collection, query, where, getDocs, Timestamp, writeBatch, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+    // --- GLOBAL VARIABLES ---
+    let app, db, auth;
+    let userId;
+    const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+    const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+    let currentView = 'coach'; // 'coach' or 'manager'
+    let currentCoachState = {
+        mode: 'dashboard', // 'dashboard' or 'attendance'
+        classId: null,
+        className: '',
+        expectedRoster: [], // Now only holds the IDs of scheduled athletes
+        officialRoster: new Set(),
+        currentAttendance: new Set()
+    };
+    let globalData = {
+        allClasses: {},
+        allAthletes: {},
+        allRosters: {}, // ClassId -> [AthleteIds]
+        attendanceLogs: {}, // Date_ClassId -> Log
+        allCoaches: {} // New: CoachId -> { name: 'Coach Name' }
+    };
+
+    // --- UTILITY FUNCTIONS ---
+
+    function showMessage(message, type = 'success') {
+        const box = document.getElementById('message-box');
+        box.textContent = message;
+        box.className = `fixed top-4 right-4 text-white p-4 rounded-lg shadow-xl z-50 transition duration-300 ${type === 'success' ? 'bg-green-500' : 'bg-red-500'}`;
+        box.classList.remove('hidden');
+        setTimeout(() => {
+            box.classList.add('hidden');
+        }, 3000);
+    }
+
+    function getAttendancePath(collectionName) {
+        // Public data path for shared team information
+        return `artifacts/${appId}/public/data/${collectionName}`;
+    }
+
+    function formatDateTime(timestamp) {
+        if (!timestamp) return 'N/A';
+        const date = timestamp.toDate();
+        return date.toLocaleDateString('en-US', { 
+            weekday: 'short', 
+            year: 'numeric', 
+            month: 'short', 
+            day: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit'
+        });
+    }
+
+    function formatDate(date) {
+        if (!date) return 'N/A';
+        return date.toLocaleDateString('en-US', { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric' });
+    }
+
+    function getTodayKey() {
+        // Returns YYYY-MM-DD
+        return (new Date()).toISOString().split('T')[0];
+    }
+
+    function generateRandomId() {
+        return crypto.randomUUID();
+    }
+
+    // --- FIREBASE INITIALIZATION & AUTHENTICATION ---
+
+    async function initFirebase() {
+        setLogLevel('error'); // Keep logs clean unless debugging
+        document.getElementById('loading').classList.remove('hidden');
+
+        try {
+            // --- Crucial Check for Local Execution ---
+            if (Object.keys(firebaseConfig).length === 0) {
+                 throw new Error("Configuration Missing: This app must be run in the secure platform environment to automatically receive its database keys.");
+            }
+            // --- End Check ---
+
+            app = initializeApp(firebaseConfig);
+            db = getFirestore(app);
+            auth = getAuth(app);
+
+
+            // Handle Authentication
+            await new Promise(resolve => {
+                const unsubscribe = onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        // Attempt to get the coach name, default to ID snippet
+                        const coachInfo = globalData.allCoaches[userId];
+                        const displayId = coachInfo ? coachInfo.name : `ID: ${userId.substring(0, 8)}...`;
+                        document.getElementById('user-info').textContent = `User: ${displayId}`;
+                        
+                        // Unsubscribe after the first check
+                        unsubscribe();
+                        resolve();
+                    } else {
+                        // FIX: We rely ONLY on the initial auth token provided by the environment
+                        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                            await signInWithCustomToken(auth, __initial_auth_token);
+                        } else {
+                            // If token is missing, fail initialization with a clear error
+                            throw new Error("Authentication Token Missing: Cannot sign in without the required custom token.");
+                        }
+                    }
+                });
+            });
+
+            // Start real-time listeners after authentication
+            setupRealtimeListeners();
+            
+            // Hide loading screen and render initial view
+            document.getElementById('loading').classList.add('hidden');
+            renderApp();
+
+        } catch (error) {
+            console.error("Error during Firebase initialization or sign-in:", error);
+            document.getElementById('loading').innerHTML = `
+                <div class="p-12 bg-red-100 rounded-xl border border-red-400 max-w-lg mx-auto mt-12">
+                    <h3 class="text-xl font-bold text-red-700 mb-4">SETUP ERROR: Database Initialization Failed</h3>
+                    <p class="text-gray-700">The app failed to connect to the database or the sign-in was blocked.</p>
+                    <p class="text-gray-700 mt-3"><strong>Action Required:</strong> Please ensure you are viewing and using this app directly within the **Canvas document editor** to ensure the database keys are securely available. If the problem persists, the platform's security blocked the sign-in attempt.</p>
+                    <p class="text-xs text-red-500 mt-4">Technical Details: ${error.message || 'Check browser console.'}</p>
+                </div>
+            `;
+        }
+    }
+
+    function setupRealtimeListeners() {
+        // Listener for Classes
+        onSnapshot(collection(db, getAttendancePath('classes')), (snapshot) => {
+            globalData.allClasses = {};
+            snapshot.forEach(doc => {
+                globalData.allClasses[doc.id] = { id: doc.id, ...doc.data() };
+            });
+            renderApp();
+        }, (error) => console.error("Error reading classes:", error));
+
+        // Listener for Athletes
+        onSnapshot(collection(db, getAttendancePath('athletes')), (snapshot) => {
+            globalData.allAthletes = {};
+            snapshot.forEach(doc => {
+                globalData.allAthletes[doc.id] = { id: doc.id, ...doc.data() };
+            });
+            renderApp();
+        }, (error) => console.error("Error reading athletes:", error));
+
+        // Listener for Rosters
+        onSnapshot(collection(db, getAttendancePath('rosters')), (snapshot) => {
+            globalData.allRosters = {};
+            snapshot.forEach(doc => {
+                globalData.allRosters[doc.id] = { id: doc.id, ...doc.data() };
+            });
+            renderApp();
+        }, (error) => console.error("Error reading rosters:", error));
+        
+        // NEW Listener for Coaches
+        onSnapshot(collection(db, getAttendancePath('coaches')), (snapshot) => {
+            globalData.allCoaches = {};
+            snapshot.forEach(doc => {
+                globalData.allCoaches[doc.id] = { id: doc.id, ...doc.data() };
+            });
+            // Update the display name in the header right away
+            if (userId) {
+                 const coachInfo = globalData.allCoaches[userId];
+                 const displayId = coachInfo ? coachInfo.name : `ID: ${userId.substring(0, 8)}...`;
+                 document.getElementById('user-info').textContent = `User: ${displayId}`;
+            }
+            renderApp();
+        }, (error) => console.error("Error reading coaches:", error));
+
+
+        // Listener for Attendance Logs
+        onSnapshot(collection(db, getAttendancePath('attendance_log')), (snapshot) => {
+            globalData.attendanceLogs = {};
+            snapshot.forEach(doc => {
+                globalData.attendanceLogs[doc.id] = { id: doc.id, ...doc.data() };
+            });
+            renderApp();
+        }, (error) => console.error("Error reading attendance logs:", error));
+    }
+
+
+    // --- APP LOGIC AND VIEWS ---
+
+    function renderApp() {
+        if (currentView === 'coach') {
+            renderCoachView();
+        } else {
+            renderManagerView();
+        }
+    }
+
+    // Exported function for inline HTML call
+    window.toggleAppView = () => {
+        currentView = currentView === 'coach' ? 'manager' : 'coach';
+        document.getElementById('toggle-view-btn').textContent = currentView === 'coach' ? 'Switch to Manager View' : 'Switch to Coach View';
+        renderApp();
+    };
+
+    // --- COACH VIEW IMPLEMENTATION ---
+
+    function renderCoachView() {
+        const contentDiv = document.getElementById('content');
+        if (currentCoachState.mode === 'dashboard') {
+            contentDiv.innerHTML = `
+                <div class="p-6 bg-white rounded-xl shadow-2xl">
+                    <h2 class="text-3xl font-extrabold text-gray-800 mb-6 border-b-2 border-indigo-400 pb-2">Coach Dashboard - Today's Classes (${formatDate(new Date())})</h2>
+                    <div id="class-list" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                        ${Object.values(globalData.allClasses).length > 0
+                            ? Object.values(globalData.allClasses).map(c => `
+                                <div class="bg-indigo-50 p-6 rounded-xl border border-indigo-200 shadow-md flex flex-col justify-between hover:shadow-lg transition duration-150">
+                                    <div>
+                                        <p class="text-xl font-semibold text-indigo-700">${c.name}</p>
+                                        <p class="text-sm text-gray-600 mb-4">${c.time}</p>
+                                    </div>
+                                    <button onclick="window.startAttendance('${c.id}', '${c.name}')" class="mt-4 w-full bg-indigo-600 text-white font-bold py-2 rounded-lg hover:bg-indigo-700 transition duration-150 shadow-md hover:shadow-lg">
+                                        Take Attendance
+                                    </button>
+                                </div>
+                            `).join('')
+                            : `<p class="text-gray-500 col-span-3">No classes are currently scheduled. Use the 'Initialize Mock Data' button below to add some.</p>`
+                        }
+                    </div>
+                </div>
+                <div class="mt-8 text-center">
+                    <button onclick="window.initializeMockData()" class="bg-gray-700 text-white font-semibold py-2 px-4 rounded-lg hover:bg-gray-800 transition duration-150">
+                        Initialize Mock Data (Run Once)
+                    </button>
+                </div>
+            `;
+        } else if (currentCoachState.mode === 'attendance') {
+            const roster = currentCoachState.expectedRoster;
+            contentDiv.innerHTML = `
+                <div class="p-6 bg-white rounded-xl shadow-2xl">
+                    <button onclick="window.cancelAttendance()" class="text-indigo-600 hover:text-indigo-800 mb-4 flex items-center">
+                        <svg class="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 19l-7-7m0 0l7-7m-7 7h18"></path></svg>
+                        Back to Classes
+                    </button>
+                    <h2 class="text-3xl font-extrabold text-gray-800 mb-6 border-b-2 border-indigo-400 pb-2">
+                        Attendance for: ${currentCoachState.className}
+                    </h2>
+                    
+                    <!-- Scheduled Roster -->
+                    <div class="mb-8">
+                        <h3 class="text-xl font-semibold text-gray-700 mb-3">1. Scheduled Athletes (${roster.length})</h3>
+                        <p class="text-sm text-gray-500 mb-2">Mark the scheduled students who are present.</p>
+                        <div id="main-roster-list" class="h-64 overflow-y-auto custom-scroll p-4 border rounded-lg bg-gray-50">
+                            ${roster.length > 0
+                                ? roster.map(athleteId => {
+                                    const athlete = globalData.allAthletes[athleteId] || { name: 'Unknown Athlete', id: athleteId };
+                                    const isChecked = currentCoachState.currentAttendance.has(athlete.id);
+                                    
+                                    return `
+                                        <div id="athlete-${athlete.id}" onclick="window.togglePresence('${athlete.id}')"
+                                            class="flex items-center justify-between p-3 mb-2 rounded-lg cursor-pointer transition duration-100 ${isChecked ? 'bg-indigo-200 border-indigo-400 shadow-md' : 'bg-white border hover:bg-gray-100'}">
+                                            
+                                            <div class="flex items-center space-x-2">
+                                                <span class="text-lg font-medium ${isChecked ? 'text-indigo-800' : 'text-gray-700'}">${athlete.name}</span>
+                                                <span class="text-xs font-semibold bg-indigo-500 text-white px-2 py-0.5 rounded-full">SCHEDULED</span>
+                                            </div>
+
+                                            <span class="text-sm font-bold ${isChecked ? 'text-indigo-800' : 'text-gray-400'}">
+                                                ${isChecked ? 'PRESENT' : 'ABSENT'}
+                                            </span>
+                                        </div>
+                                    `;
+                                }).join('')
+                                : `<p class="text-gray-500">No scheduled athletes for this class.</p>`
+                            }
+                        </div>
+                    </div>
+
+                    <!-- Make-up / Unexpected Search -->
+                    <div class="mb-6">
+                        <h3 class="text-xl font-semibold text-gray-700 mb-3">2. Make-Up / Unexpected Attendance</h3>
+                        <input 
+                            type="text" 
+                            id="athlete-search-input"
+                            oninput="window.searchForAthlete(this.value)"
+                            placeholder="Type name to search for make-up students..." 
+                            class="w-full p-3 border-2 border-indigo-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 transition duration-150 mb-3"
+                        >
+                        <div id="search-results-list" class="max-h-48 overflow-y-auto custom-scroll border rounded-lg bg-white p-2">
+                            <p class="text-gray-400 italic text-sm p-2">Search results will appear here. Students marked present will be flagged as 'Unexpected' in the Manager View.</p>
+                        </div>
+                    </div>
+
+                    <div class="mt-6">
+                        <button onclick="window.saveAttendance()" class="w-full bg-green-600 text-white font-bold py-3 rounded-lg text-xl hover:bg-green-700 transition duration-150 shadow-lg hover:shadow-xl">
+                            Submit Attendance (${currentCoachState.currentAttendance.size} Present)
+                        </button>
+                    </div>
+                </div>
+            `;
+
+            // Re-render the attendance count on initial load
+            document.querySelector('.w-full.bg-green-600').textContent = `Submit Attendance (${currentCoachState.currentAttendance.size} Present)`;
+        }
+    }
+
+    // New search function for make-up students
+    window.searchForAthlete = (query) => {
+        const resultsDiv = document.getElementById('search-results-list');
+        const searchTerm = query.toLowerCase().trim();
+
+        if (searchTerm.length < 2) {
+            resultsDiv.innerHTML = `<p class="text-gray-400 italic text-sm p-2">Search results will appear here. Students marked present will be flagged as 'Unexpected' in the Manager View.</p>`;
+            return;
+        }
+        
+        // Find ALL athletes matching the search term (for checking if they are already scheduled)
+        const matchingAthletes = Object.values(globalData.allAthletes).filter(athlete => 
+            athlete.name.toLowerCase().includes(searchTerm)
+        );
+
+        if (matchingAthletes.length === 0) {
+            resultsDiv.innerHTML = `<p class="text-gray-400 italic text-sm p-2">No athletes found matching your search term.</p>`;
+            return;
+        }
+
+        // Separate matches into Scheduled (already in Section 1) and Make-up Candidates
+        const scheduledMatch = matchingAthletes.find(athlete => currentCoachState.officialRoster.has(athlete.id));
+        const makeUpCandidates = matchingAthletes.filter(athlete => !currentCoachState.officialRoster.has(athlete.id));
+
+        if (scheduledMatch) {
+            // Priority 1: If the search matches a student already on the schedule, alert the coach.
+            resultsDiv.innerHTML = `
+                <div class="p-3 mb-1 rounded-lg bg-indigo-100 border border-indigo-300 text-indigo-800 font-semibold text-sm">
+                    <p>⚠️ **${scheduledMatch.name}** is already in the **Scheduled Roster** (Section 1).</p>
+                    <p class="mt-1 font-normal text-xs">Please check them in above.</p>
+                </div>
+            `;
+            return;
+        }
+        
+        // Priority 2: If we only have make-up candidates, list them.
+        if (makeUpCandidates.length > 0) {
+            resultsDiv.innerHTML = makeUpCandidates.map(athlete => {
+                const isChecked = currentCoachState.currentAttendance.has(athlete.id);
+                return `
+                    <div id="athlete-${athlete.id}" onclick="window.togglePresence('${athlete.id}')"
+                        class="flex items-center justify-between p-3 mb-1 rounded-lg cursor-pointer transition duration-100 ${isChecked ? 'bg-yellow-200 border-yellow-400 shadow-sm' : 'bg-white border hover:bg-yellow-100'}">
+                        
+                        <div class="flex items-center space-x-2">
+                            <span class="text-lg font-medium ${isChecked ? 'text-yellow-800' : 'text-gray-700'}">${athlete.name}</span>
+                            <span class="text-xs font-semibold bg-yellow-500 text-white px-2 py-0.5 rounded-full">MAKE-UP CANDIDATE</span>
+                        </div>
+
+                        <span class="text-sm font-bold ${isChecked ? 'text-yellow-800' : 'text-gray-400'}">
+                            ${isChecked ? 'PRESENT' : 'NOT YET CHECKED'}
+                        </span>
+                    </div>
+                `;
+            }).join('');
+            return;
+        }
+
+        // Fallback (Should be covered by scheduledMatch check, but for safety)
+        resultsDiv.innerHTML = `<p class="text-gray-400 italic text-sm p-2">No athletes found matching your search who are NOT on the scheduled roster.</p>`;
+    };
+
+
+    window.startAttendance = (classId, className) => {
+        const rosterData = Object.values(globalData.allRosters).find(r => r.classId === classId);
+        let scheduledIds = [];
+        if (rosterData && Array.isArray(rosterData.athleteIds)) {
+            scheduledIds = rosterData.athleteIds;
+        }
+
+        // Initialize currentAttendance set with previously marked present students if any
+        // For simplicity in this demo, we start fresh, but in a real app, you might load a draft log.
+        
+        currentCoachState = {
+            mode: 'attendance',
+            classId: classId,
+            className: className,
+            expectedRoster: scheduledIds.sort((a, b) => { // Only scheduled students for the main list
+                const nameA = globalData.allAthletes[a]?.name || '';
+                const nameB = globalData.allAthletes[b]?.name || '';
+                return nameA.localeCompare(nameB);
+            }),
+            officialRoster: new Set(scheduledIds), // Store official roster set for quick lookups
+            currentAttendance: new Set()
+        };
+        renderApp();
+    };
+
+    window.togglePresence = (athleteId) => {
+        const set = currentCoachState.currentAttendance;
+        const isScheduled = currentCoachState.officialRoster.has(athleteId);
+        
+        if (set.has(athleteId)) {
+            set.delete(athleteId);
+        } else {
+            set.add(athleteId);
+        }
+        
+        // Re-render the UI elements for both the main list and the search results list
+        const mainDiv = document.getElementById(`athlete-${athleteId}`);
+        if (mainDiv) {
+            const isChecked = set.has(athleteId);
+            const bgColor = isScheduled ? 'bg-indigo-200 border-indigo-400' : 'bg-yellow-200 border-yellow-400';
+            const hoverColor = isScheduled ? 'bg-white border hover:bg-gray-100' : 'bg-white border hover:bg-yellow-100';
+            const textColor = isScheduled ? 'text-indigo-800' : 'text-yellow-800';
+
+            mainDiv.className = `flex items-center justify-between p-3 mb-2 rounded-lg cursor-pointer transition duration-100 ${isChecked ? bgColor + ' shadow-md' : hoverColor}`;
+            mainDiv.querySelector('span:last-child').textContent = isChecked ? 'PRESENT' : (isScheduled ? 'ABSENT' : 'NOT YET CHECKED');
+            mainDiv.querySelector('span:last-child').className = `text-sm font-bold ${isChecked ? textColor : 'text-gray-400'}`;
+        }
+
+        // Re-run the search to update its list if the toggled athlete was a search result
+        const searchInput = document.getElementById('athlete-search-input');
+        if(searchInput) {
+             window.searchForAthlete(searchInput.value);
+        }
+
+        // Update the submit button count
+        document.querySelector('.w-full.bg-green-600').textContent = `Submit Attendance (${set.size} Present)`;
+    };
+
+    window.cancelAttendance = () => {
+        currentCoachState.mode = 'dashboard';
+        currentCoachState.classId = null;
+        renderApp();
+    };
+
+    window.saveAttendance = async () => {
+        if (!currentCoachState.classId) return;
+
+        const logId = `${getTodayKey()}_${currentCoachState.classId}`;
+        const presentIds = Array.from(currentCoachState.currentAttendance);
+
+        const attendanceData = {
+            dateKey: getTodayKey(),
+            classId: currentCoachState.classId,
+            className: currentCoachState.className,
+            coachId: userId,
+            presentAthleteIds: presentIds,
+            timestamp: Timestamp.now()
+        };
+
+        try {
+            await setDoc(doc(db, getAttendancePath('attendance_log'), logId), attendanceData);
+            showMessage('Attendance submitted successfully!');
+            window.cancelAttendance();
+        } catch (error) {
+            console.error("Error saving attendance:", error);
+            showMessage('Error saving attendance.', 'error');
+        }
+    };
+
+
+    // --- MANAGER VIEW IMPLEMENTATION (The Analysis Backend) ---
+
+    function getAttendanceAnalysis() {
+        const analysis = {};
+        const todayKey = getTodayKey();
+
+        // 1. Group attendance logs by Class ID
+        const logsByClass = Object.values(globalData.attendanceLogs).reduce((acc, log) => {
+            if (!acc[log.classId]) acc[log.classId] = [];
+            acc[log.classId].push(log);
+            return acc;
+        }, {});
+
+        // 2. Iterate through all classes to create a dashboard view
+        Object.values(globalData.allClasses).forEach(classDef => {
+            const classId = classDef.id;
+            const rosterDoc = Object.values(globalData.allRosters).find(r => r.classId === classId);
+            const expectedAthleteIds = rosterDoc && Array.isArray(rosterDoc.athleteIds) ? rosterDoc.athleteIds : [];
+
+            analysis[classId] = {
+                classDef: classDef,
+                expectedCount: expectedAthleteIds.length,
+                dailyLogs: [],
+                expectedIds: new Set(expectedAthleteIds),
+                totalLogs: logsByClass[classId] || []
+            };
+
+            // 3. Analyze each attendance log for this class (Manager only needs the most recent)
+            analysis[classId].totalLogs.sort((a, b) => {
+                const timeA = a.timestamp ? (a.timestamp.toMillis() || 0) : 0;
+                const timeB = b.timestamp ? (b.timestamp.toMillis() || 0) : 0;
+                return timeB - timeA;
+            });
+
+            // Simple weekly view (last 7 days of logs)
+            const recentLogs = analysis[classId].totalLogs.slice(0, 7);
+
+            recentLogs.forEach(log => {
+                const logDate = log.dateKey;
+                const presentIds = new Set(log.presentAthleteIds);
+
+                const absent = [];
+                const makeUp = [];
+                const presentNames = [];
+                
+                // Get Coach Name
+                const coachName = globalData.allCoaches[log.coachId]?.name || `ID: ${log.coachId.substring(0, 8)}...`;
+
+                // Check for ABSENT (Expected but not Present)
+                expectedAthleteIds.forEach(athleteId => {
+                    if (!presentIds.has(athleteId)) {
+                        absent.push(globalData.allAthletes[athleteId]?.name || `ID:${athleteId}`);
+                    }
+                });
+
+                // Check for MAKE-UP (Present but not Expected) AND Present List
+                presentIds.forEach(athleteId => {
+                    const name = globalData.allAthletes[athleteId]?.name || `ID:${athleteId}`;
+                    presentNames.push(name);
+                    
+                    if (!analysis[classId].expectedIds.has(athleteId)) {
+                        makeUp.push(name);
+                    }
+                });
+
+                analysis[classId].dailyLogs.push({
+                    logDate: logDate,
+                    presentCount: presentIds.size,
+                    presentNames: presentNames, 
+                    absent: absent,
+                    makeUp: makeUp,
+                    timestamp: log.timestamp, 
+                    coachName: coachName // Updated to use the name
+                });
+            });
+        });
+
+        return analysis;
+    }
+
+
+    function renderManagerView() {
+        const contentDiv = document.getElementById('content');
+        const analysis = getAttendanceAnalysis();
+        const classes = Object.values(globalData.allClasses).sort((a, b) => a.name.localeCompare(b.name));
+        const hasAnyClasses = classes.length > 0;
+        const hasAnyLogs = Object.values(globalData.attendanceLogs).length > 0;
+
+        // 1. Check for missing classes (Data not initialized)
+        if (!hasAnyClasses) {
+            contentDiv.innerHTML = `
+                <div class="p-12 text-center bg-white rounded-xl shadow-lg border border-gray-200 mt-12">
+                    <h3 class="text-2xl font-bold text-indigo-700 mb-3">No Classes Found</h3>
+                    <p class="text-gray-600 mb-4">Please switch back to the Coach View and click the <strong>'Initialize Mock Data (Run Once)'</strong> button to load your classes and athlete rosters.</p>
+                </div>
+            `;
+            return;
+        }
+        
+        // 2. Check for missing logs (Data initialized, but attendance not taken)
+        if (hasAnyClasses && !hasAnyLogs) {
+             contentDiv.innerHTML = `
+                <div class="p-12 text-center bg-white rounded-xl shadow-lg border border-gray-200 mt-12">
+                    <h3 class="text-2xl font-bold text-indigo-700 mb-3">No Attendance Logs Found</h3>
+                    <p class="text-gray-600 mb-4">The system knows your classes, but no coach has submitted attendance yet.</p>
+                    <p class="text-gray-600">Please switch back to the Coach View to log at least one class attendance, then return here.</p>
+                </div>
+            `;
+            return;
+        }
+        
+        // 3. Render full dashboard (Classes and Logs exist)
+        const dashboardHTML = classes.map(classDef => {
+            const classAnalysis = analysis[classDef.id];
+            const hasClassLogs = classAnalysis && classAnalysis.dailyLogs.length > 0;
+            
+            const logHTML = hasClassLogs ? classAnalysis.dailyLogs.map(log => `
+                <div class="border-b border-gray-200 p-4 last:border-b-0">
+                    <p class="text-lg font-semibold text-gray-700 mb-2">
+                        Log Time: ${formatDateTime(log.timestamp)} <span class="text-sm text-gray-500 font-normal ml-2">(${log.presentCount} Present)</span>
+                    </p>
+
+                    <!-- PRESENT LIST -->
+                    <div class="flex flex-col space-y-1 mb-2 bg-green-50 p-2 rounded-lg border border-green-200">
+                        <span class="font-bold text-green-700">Present Athletes:</span>
+                        <p class="text-sm italic">${log.presentNames.length > 0 ? log.presentNames.join(', ') : 'None'}</p>
+                    </div>
+
+                    <!-- ABSENT FLAGGING -->
+                    <div class="flex flex-col space-y-1 ${log.absent.length > 0 ? 'bg-red-50 p-2 rounded-lg border border-red-200' : 'text-green-600'}">
+                        <span class="font-bold ${log.absent.length > 0 ? 'text-red-700' : 'text-green-600'}">
+                            ${log.absent.length} Absent:
+                        </span>
+                        <p class="text-sm italic">${log.absent.length > 0 ? log.absent.join(', ') : 'Everyone expected was present!'}</p>
+                    </div>
+
+                    <!-- MAKE-UP FLAGGING -->
+                    <div class="flex flex-col space-y-1 mt-2 ${log.makeUp.length > 0 ? 'bg-yellow-50 p-2 rounded-lg border border-yellow-200' : 'text-gray-600'}">
+                        <span class="font-bold ${log.makeUp.length > 0 ? 'text-yellow-700' : 'text-gray-600'}">
+                            ${log.makeUp.length} Unexpected Attendees (Make-Up):
+                        </span>
+                        <p class="text-sm italic">${log.makeUp.length > 0 ? log.makeUp.join(', ') : 'No unexpected attendees.'}</p>
+                    </div>
+
+                    <p class="text-xs text-gray-400 mt-2">Recorded by: ${log.coachName}</p>
+                </div>
+            `).join('') : '<p class="p-4 text-gray-500 italic">No attendance has been logged for this class yet.</p>';
+
+            return `
+                <div class="bg-white rounded-xl shadow-lg border border-gray-200">
+                    <div class="p-5 border-b border-gray-200 bg-gray-50 rounded-t-xl">
+                        <h3 class="text-2xl font-extrabold text-indigo-700">${classDef.name}</h3>
+                        <p class="text-sm text-gray-600">Expected Roster Size: ${classAnalysis ? classAnalysis.expectedCount : 0}</p>
+                    </div>
+                    <div class="custom-scroll max-h-96 overflow-y-auto">
+                        ${logHTML}
+                    </div>
+                </div>
+            `;
+        }).join('');
+
+        contentDiv.innerHTML = `
+            <div class="p-6">
+                <h2 class="text-3xl font-extrabold text-gray-800 mb-8">Manager Attendance Overview (Last 7 Logs Per Class)</h2>
+                <div id="manager-dashboard" class="grid grid-cols-1 md:grid-cols-2 gap-8">
+                    ${dashboardHTML}
+                </div>
+            </div>
+        `;
+    }
+
+    // --- MOCK DATA INITIALIZATION ---
+
+    window.initializeMockData = async () => {
+        const batch = writeBatch(db);
+
+        // 1. Athletes
+        // NOTE: Please replace this with your actual 70+ student roster!
+        const athletesData = [
+            { id: generateRandomId(), name: "Alice Johnson" },
+            { id: generateRandomId(), name: "Bob Smith" },
+            { id: generateRandomId(), name: "Charlie Brown" },
+            { id: generateRandomId(), name: "Dana Scully" },
+            { id: generateRandomId(), name: "Ethan Hunt" },
+            { id: generateRandomId(), name: "Fiona Glenn" },
+            { id: generateRandomId(), name: "Grace Hall" },
+            { id: generateRandomId(), name: "Henry Ice" },
+            { id: generateRandomId(), name: "Ivy Jones" },
+            { id: generateRandomId(), name: "Karl King" },
+            { id: generateRandomId(), name: "Leo Moon" },
+            { id: generateRandomId(), name: "Mia Nest" }, // Athlete 11 - NOT on Advanced Tumbling Roster
+            { id: generateRandomId(), name: "Oscar Petch" },
+            { id: generateRandomId(), name: "Quinn Rich" },
+            // Add more students here up to 70+
+        ];
+        athletesData.forEach(a => {
+            batch.set(doc(db, getAttendancePath('athletes'), a.id), { name: a.name });
+        });
+
+        // NEW: 2. Coaches (Using the current user ID for the mock coach entry)
+        const mockCoachId = userId || generateRandomId(); // Use current ID, or a mock one if needed
+        const coachesData = [
+            { id: mockCoachId, name: "Coach Alex" },
+            // Add other coaches here if you know their User IDs:
+            // { id: "OTHER_COACH_ID", name: "Coach Bailey" } 
+        ];
+        coachesData.forEach(c => {
+            batch.set(doc(db, getAttendancePath('coaches'), c.id), { name: c.name });
+        });
+
+
+        // 3. Classes
+        // NOTE: Please replace these with your actual classes and times!
+        const classesData = [
+            { id: generateRandomId(), name: "Advanced Tumbling", time: "Mon 6:00 PM" },
+            { id: generateRandomId(), name: "Beginner Gymnastics", time: "Wed 4:30 PM" },
+            { id: generateRandomId(), name: "Elite Team Practice", time: "Fri 7:00 PM" },
+        ];
+        classesData.forEach(c => {
+            batch.set(doc(db, getAttendancePath('classes'), c.id), { name: c.name, time: c.time });
+        });
+
+        // 4. Rosters (Expected Attendance)
+        // NOTE: This maps student IDs (from section 1) to Class IDs (from section 2)
+        const rostersData = [
+            { // Advanced Tumbling (5 Students)
+                classId: classesData[0].id,
+                athleteIds: [athletesData[0].id, athletesData[1].id, athletesData[3].id, athletesData[6].id, athletesData[8].id]
+            },
+            { // Beginner Gymnastics (4 Students)
+                classId: classesData[1].id,
+                athleteIds: [athletesData[2].id, athletesData[4].id, athletesData[5].id, athletesData[7].id]
+            },
+            { // Elite Team Practice (More Students)
+                classId: classesData[2].id,
+                athleteIds: athletesData.slice(5).map(a => a.id) // Fiona, Grace, Henry, Ivy, Karl, Leo, Mia, Oscar, Quinn
+            }
+        ];
+        rostersData.forEach(r => {
+            // Using classId as the document ID for simplicity in roster lookups
+            batch.set(doc(db, getAttendancePath('rosters'), r.classId), r);
+        });
+
+        try {
+            await batch.commit();
+            showMessage('Mock data initialized successfully! You can now take attendance.', 'success');
+        } catch (error) {
+            console.error("Error initializing mock data:", error);
+            showMessage('Error initializing mock data.', 'error');
+        }
+    };
+
+    // Initialize Firebase when the window loads
+    window.onload = initFirebase;
+
+</script>
+</body>
+</html>
+
