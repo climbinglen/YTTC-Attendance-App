@@ -514,7 +514,7 @@ window.App = function App() { // FINAL STRUCTURAL FIX: ensures component is glob
                 resultsDiv.innerHTML = makeUpCandidates.map(athlete => {
                     const isChecked = currentAttendance.has(athlete.id);
                     return `
-                        <div id="athlete-${athlete.id}" onclick="window.togglePresence('${athlete.id}')"
+                        <div id="athlete-${athlete.id}" onClick={() => togglePresence(athlete.id)}
                             className="flex items-center justify-between p-3 mb-1 rounded-lg cursor-pointer transition duration-100 ${isChecked ? 'bg-yellow-200 border-yellow-400 shadow-sm' : 'bg-white border hover:bg-yellow-100'}">
                             
                             <div className="flex items-center space-x-2">
